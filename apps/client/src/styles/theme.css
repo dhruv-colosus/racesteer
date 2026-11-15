@@ -1,0 +1,506 @@
+/*
+ * Tilt Rush UI language: dark slate panels cut as parallelograms, a hot
+ * magenta accent, white condensed-italic capitals. Every surface leans the
+ * same way (--skew) so menus, HUD and the phone pad read as one system.
+ */
+:root {
+  --ink: #0b0f1a;
+  --ink-2: #131a2a;
+  --panel: rgba(30, 41, 59, 0.86);
+  --panel-solid: #1e293b;
+  --panel-hi: #2a3850;
+  --line: rgba(148, 163, 184, 0.28);
+  --accent: #ff2d78;
+  --accent-deep: #c9145a;
+  --cyan: #22d3ee;
+  --text: #f8fafc;
+  --muted: #9aa8bd;
+  --good: #4ade80;
+  --warn: #facc15;
+  --skew: -12deg;
+  --font: 'Barlow Condensed', 'Arial Narrow', 'Helvetica Neue', sans-serif;
+
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--ink);
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+}
+
+/* ---- primitives ---------------------------------------------------------- */
+
+/* A leaning panel. The background leans; the content stays upright. */
+.slab {
+  position: relative;
+  isolation: isolate;
+  padding: 10px 22px;
+}
+.slab::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--panel);
+  transform: skewX(var(--skew));
+  backdrop-filter: blur(6px);
+}
+.slab--accent::before {
+  background: var(--accent);
+}
+.slab--solid::before {
+  background: var(--panel-solid);
+}
+
+.caps {
+  text-transform: uppercase;
+  font-style: italic;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.muted {
+  color: var(--muted);
+}
+.accent {
+  color: var(--accent);
+}
+
+/* Two leaning bars, the signature flourish either side of a headline. */
+.stripes {
+  display: inline-flex;
+  gap: 7px;
+  transform: skewX(var(--skew));
+}
+.stripes i {
+  display: block;
+  width: 26px;
+  height: 100%;
+  min-height: 14px;
+  background: var(--accent);
+}
+.stripes i:nth-child(2) {
+  width: 12px;
+  background: var(--text);
+}
+.stripes--flip {
+  flex-direction: row-reverse;
+}
+
+.btn {
+  position: relative;
+  isolation: isolate;
+  border: 0;
+  background: none;
+  padding: 12px 30px;
+  min-height: 48px;
+  cursor: pointer;
+  text-transform: uppercase;
+  font-style: italic;
+  font-weight: 800;
+  font-size: 1.25rem;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  transition: transform 0.08s ease, filter 0.12s ease;
+}
+.btn::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: var(--panel-hi);
+  transform: skewX(var(--skew));
+  box-shadow: inset 0 0 0 2px var(--line);
+}
+.btn:hover:not(:disabled) {
+  filter: brightness(1.18);
+}
+.btn:active:not(:disabled) {
+  transform: translateY(1px) scale(0.985);
+}
+.btn:focus-visible {
+  outline: none;
+}
+.btn:focus-visible::before {
+  box-shadow: inset 0 0 0 3px var(--cyan);
+}
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.btn--primary::before {
+  background: linear-gradient(180deg, var(--accent), var(--accent-deep));
+  box-shadow: none;
+}
+.btn--ghost::before {
+  background: transparent;
+}
+.btn--small {
+  padding: 6px 18px;
+  min-height: 36px;
+  font-size: 1rem;
+}
+.btn--wide {
+  width: 100%;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.field > span {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+}
+.input {
+  width: 100%;
+  min-height: 46px;
+  padding: 8px 14px;
+  border: 2px solid var(--line);
+  background: rgba(11, 15, 26, 0.7);
+  font-size: 1.2rem;
+  font-weight: 700;
+  outline: none;
+  border-radius: 0;
+}
+.input:focus {
+  border-color: var(--accent);
+}
+.input--code {
+  text-transform: uppercase;
+  letter-spacing: 0.28em;
+  font-style: italic;
+  font-size: 1.45rem;
+  text-align: center;
+  padding-left: 8px;
+  padding-right: 4px;
+}
+
+.toast {
+  color: var(--warn);
+  font-size: 1rem;
+  min-height: 1.4em;
+}
+
+/* ---- race HUD ------------------------------------------------------------ */
+
+.stage {
+  position: fixed;
+  inset: 0;
+  background: #cfe6f7;
+}
+/* Direct child only: the minimap is a canvas too. */
+.stage > canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.hud {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  padding: max(18px, env(safe-area-inset-top)) max(22px, env(safe-area-inset-right)) max(18px, env(safe-area-inset-bottom))
+    max(22px, env(safe-area-inset-left));
+  text-shadow: 0 2px 0 rgba(0, 0, 0, 0.25);
+}
+.hud > * {
+  position: absolute;
+}
+
+.hud-pause {
+  top: 18px;
+  left: 22px;
+  pointer-events: auto;
+  width: 46px;
+  height: 46px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+}
+.hud-pause i {
+  display: block;
+  width: 8px;
+  height: 30px;
+  background: var(--text);
+  filter: drop-shadow(0 2px 2px rgba(0, 0, 0, 0.5));
+}
+
+.hud-chips {
+  top: 18px;
+  right: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+}
+.chip {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 22px;
+  min-width: 220px;
+  padding: 4px 18px;
+  font-size: 1.7rem;
+  line-height: 1.15;
+}
+.chip b {
+  font-weight: 800;
+  font-style: italic;
+  font-variant-numeric: tabular-nums;
+}
+.chip span {
+  text-transform: uppercase;
+  font-style: italic;
+  font-weight: 700;
+}
+.chip--small {
+  font-size: 1.25rem;
+  min-width: 180px;
+}
+
+.banner {
+  top: 26px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  height: 78px;
+  animation: banner-in 0.22s cubic-bezier(0.2, 1.4, 0.4, 1);
+}
+.banner .slab {
+  display: flex;
+  align-items: center;
+  padding: 0 46px;
+  font-size: 3.6rem;
+  line-height: 1;
+}
+.banner--go .slab::before {
+  background: var(--accent);
+}
+@keyframes banner-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) scale(1.25);
+  }
+}
+
+.hud-warning {
+  top: 30%;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 2.2rem;
+  color: var(--warn);
+  animation: blink 0.6s steps(2) infinite;
+}
+@keyframes blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.speedo {
+  right: 14px;
+  bottom: 10px;
+  width: 230px;
+  height: 230px;
+}
+.speedo svg {
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.45));
+}
+/* The speed sits in the open gap at the bottom of the dial. */
+.speedo-value {
+  position: absolute;
+  left: 50%;
+  bottom: -2px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-style: italic;
+  font-weight: 800;
+  font-size: 3.5rem;
+  line-height: 0.9;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.speedo-value small {
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.hud-left {
+  left: 22px;
+  bottom: 18px;
+  display: flex;
+  align-items: flex-end;
+  gap: 14px;
+}
+.minimap {
+  width: 176px;
+  height: 176px;
+  border-radius: 50%;
+  background: rgba(30, 41, 59, 0.78);
+  box-shadow: 0 0 0 3px rgba(248, 250, 252, 0.85), 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+.boost {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+  letter-spacing: 0.14em;
+}
+.boost-track {
+  width: 18px;
+  height: 120px;
+  background: rgba(30, 41, 59, 0.78);
+  box-shadow: 0 0 0 2px rgba(248, 250, 252, 0.7);
+  transform: skewX(var(--skew));
+  display: flex;
+  align-items: flex-end;
+}
+.boost-fill {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(0deg, var(--warn), #fff7c2);
+  transform-origin: bottom;
+}
+.boost--active .boost-fill {
+  background: linear-gradient(0deg, var(--cyan), #e0fbff);
+}
+
+.hud-hint {
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  padding: 4px 18px;
+  font-size: 1rem;
+  color: var(--muted);
+}
+
+/* ---- overlays ------------------------------------------------------------ */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(11, 15, 26, 0.62);
+  backdrop-filter: blur(4px);
+  z-index: 20;
+  overflow: auto;
+}
+.card {
+  width: min(560px, 100%);
+  padding: 26px 30px;
+  background: var(--panel-solid);
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5), inset 0 0 0 2px var(--line);
+  border-left: 8px solid var(--accent);
+}
+.card h2 {
+  margin: 0 0 16px;
+  font-size: 2.6rem;
+  line-height: 1;
+}
+.card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 22px;
+}
+
+.loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: var(--ink);
+  font-size: 2rem;
+  z-index: 10;
+}
+
+@media (max-width: 760px), (max-height: 520px) {
+  .chip {
+    font-size: 1.15rem;
+    min-width: 150px;
+    padding: 2px 12px;
+  }
+  .chip--small {
+    font-size: 0.95rem;
+    min-width: 130px;
+  }
+  .banner {
+    height: 52px;
+    top: 14px;
+  }
+  .banner .slab {
+    font-size: 2.2rem;
+    padding: 0 26px;
+  }
+  .speedo {
+    width: 150px;
+    height: 150px;
+  }
+  .speedo-value {
+    font-size: 2.3rem;
+  }
+  .speedo-value small {
+    font-size: 0.75rem;
+  }
+  .minimap {
+    width: 112px;
+    height: 112px;
+  }
+  .boost-track {
+    height: 78px;
+  }
+  .hud-hint {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .banner,
+  .hud-warning {
+    animation: none;
+  }
+}

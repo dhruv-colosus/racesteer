@@ -1,0 +1,16 @@
+{
+  "name": "racing-sim",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n server,display,phone -c magenta,cyan,yellow \"pnpm --filter @racing/server dev\" \"pnpm --filter @racing/client dev\" \"pnpm --filter @racing/client dev:lan\"",
+    "typecheck": "pnpm -r typecheck",
+    "test": "vitest run",
+    "build": "pnpm --filter @racing/client build"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.7",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}

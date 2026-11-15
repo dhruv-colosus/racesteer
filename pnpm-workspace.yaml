@@ -1,0 +1,9 @@
+packages:
+  - apps/*
+  - packages/*
+
+# Which dependencies may run install scripts.
+# esbuild: fetches its platform binary. msgpackr-extract: optional native speed-up we do not need.
+allowBuilds:
+  esbuild: true
+  msgpackr-extract: false

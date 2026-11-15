@@ -1,0 +1,209 @@
+/* Phone controller. Everything is a big thumb target; nothing scrolls, selects or zooms. */
+
+.pad,
+.pad-intro {
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(120% 120% at 50% 0%, #1b2740 0%, var(--ink) 65%);
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  touch-action: none;
+}
+
+.pad-intro {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 24px;
+  text-align: center;
+  touch-action: manipulation;
+}
+.pad-intro-title {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  height: 56px;
+}
+.pad-intro h1 {
+  margin: 0;
+  font-size: 3.4rem;
+  line-height: 1;
+}
+.pad-intro p {
+  margin: 0;
+  max-width: 34ch;
+  line-height: 1.3;
+  font-weight: 500;
+}
+.pad-connect {
+  margin: 14px 0;
+  font-size: 1.8rem;
+  padding: 20px 44px;
+  min-height: 76px;
+}
+
+.pad {
+  --car: var(--accent);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr) minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  padding: max(10px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom))
+    max(12px, env(safe-area-inset-left));
+}
+
+.pad-top {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 44px;
+}
+.pad-name {
+  font-size: 1.4rem;
+  padding: 4px 20px;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pad-name::before {
+  background: var(--car);
+}
+.pad-status {
+  flex: 1;
+  min-width: 0;
+  font-size: 1.25rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pad-tools {
+  display: flex;
+  gap: 8px;
+}
+
+.pad-pedal {
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text);
+  font-size: clamp(1.8rem, 6vw, 3.2rem);
+  background: var(--panel-solid);
+  box-shadow: inset 0 0 0 3px var(--line);
+  clip-path: polygon(9% 0, 100% 0, 91% 100%, 0 100%);
+  transition: filter 0.05s, transform 0.05s;
+  touch-action: none;
+}
+.pad-gas {
+  background: linear-gradient(180deg, #22c55e, #15803d);
+  box-shadow: none;
+}
+.pad-brake {
+  background: linear-gradient(180deg, #ef4444, #991b1b);
+  box-shadow: none;
+}
+.pad-pedal.is-down,
+.pad-boost.is-down {
+  filter: brightness(1.45);
+  transform: scale(0.975);
+}
+
+.pad-mid {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.pad-steer {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  touch-action: none;
+}
+.pad-steer--touch {
+  background: rgba(30, 41, 59, 0.5);
+  box-shadow: inset 0 0 0 2px var(--line);
+  cursor: ew-resize;
+}
+.pad-steer-track {
+  position: relative;
+  width: 86%;
+  height: 20px;
+  background: var(--panel-solid);
+  transform: skewX(var(--skew));
+  box-shadow: inset 0 0 0 2px var(--line);
+}
+.pad-steer-track::after {
+  /* dead-centre tick */
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: -6px;
+  bottom: -6px;
+  width: 2px;
+  background: var(--muted);
+}
+.pad-steer-marker {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  justify-content: center;
+  will-change: transform;
+}
+.pad-steer-marker i {
+  display: block;
+  width: 22px;
+  height: 100%;
+  background: var(--car);
+  box-shadow: 0 0 14px var(--car);
+}
+
+.pad-boost {
+  border: 0;
+  min-height: 34%;
+  cursor: pointer;
+  color: #082f49;
+  font-size: clamp(1.4rem, 4vw, 2.2rem);
+  background: linear-gradient(180deg, #67e8f9, #06b6d4);
+  clip-path: polygon(6% 0, 100% 0, 94% 100%, 0 100%);
+  touch-action: none;
+}
+
+.pad-rotate {
+  display: none;
+  position: absolute;
+  inset: 0;
+  place-items: center;
+  padding: 24px;
+  text-align: center;
+  font-size: 2rem;
+  background: var(--ink);
+  z-index: 5;
+}
+/* Only nag real phones held upright; a desktop window that happens to be tall is left alone. */
+@media (orientation: portrait) and (pointer: coarse) {
+  .pad-rotate {
+    display: grid;
+  }
+}
+
+@media (max-height: 340px) {
+  .pad-tools .btn {
+    min-height: 30px;
+    padding: 2px 12px;
+  }
+  .pad-name,
+  .pad-status {
+    font-size: 1.05rem;
+  }
+}
