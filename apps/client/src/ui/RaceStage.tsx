@@ -38,6 +38,10 @@ export function RaceStage(props: RaceStageProps) {
   const game = useRef<Game | null>(null);
   const [loading, setLoading] = useState(true);
   const [finished, setFinished] = useState(false);
+  /** Bumped to throw the canvas and game away and build fresh ones. */
+  const [build, setBuild] = useState(0);
+  const [broken, setBroken] = useState(false);
+  const rebuilds = useRef({ count: 0, at: 0 });
 
   // Always call the latest callbacks without rebuilding the game.
   const latest = useRef(props);
@@ -46,11 +50,34 @@ export function RaceStage(props: RaceStageProps) {
   useEffect(() => {
     let disposed = false;
     const input = new InputManager();
+    const element = canvas.current!;
     setLoading(true);
     setFinished(false);
+    setBroken(false);
+
+    /**
+     * The 3D view failed (no WebGL, the GPU dropped the context, the simulation
+     * keeps throwing). Rebuild it from scratch a couple of times on its own,
+     * then stop and offer a button rather than loop forever.
+     */
+    const fail = (error: unknown) => {
+      if (disposed) return;
+      console.error('[stage] rebuilding after failure', error);
+      const now = performance.now();
+      const state = rebuilds.current;
+      if (now - state.at > 30_000) state.count = 0;
+      state.at = now;
+      if (++state.count > 2) setBroken(true);
+      else setBuild((n) => n + 1);
+    };
+    const onContextLost = (event: Event) => {
+      event.preventDefault();
+      fail(new Error('WebGL context lost'));
+    };
+    element.addEventListener('webglcontextlost', onContextLost);
 
     Game.create({
-      canvas: canvas.current!,
+      canvas: element,
       trackId,
       laps,
       color,
@@ -63,6 +90,7 @@ export function RaceStage(props: RaceStageProps) {
         latest.current.onFinish?.();
       },
       onImpact: (strength) => latest.current.onImpact?.(strength),
+      onCrash: fail,
     }).then((created) => {
       if (disposed) {
         created.dispose();
@@ -74,15 +102,16 @@ export function RaceStage(props: RaceStageProps) {
       created.start();
       setLoading(false);
       latest.current.onReady?.({ game: created, input });
-    });
+    }, fail);
 
     return () => {
       disposed = true;
+      element.removeEventListener('webglcontextlost', onContextLost);
       input.dispose();
       game.current?.dispose();
       game.current = null;
     };
-  }, [trackId, laps, color, slot]);
+  }, [trackId, laps, color, slot, build]);
 
   useEffect(() => {
     if (game.current) game.current.goAt = goAt ?? Infinity;
@@ -90,12 +119,35 @@ export function RaceStage(props: RaceStageProps) {
 
   return (
     <div className="stage" onPointerDown={() => game.current?.enableAudio()}>
-      <canvas ref={canvas} />
+      {/* Keyed so a rebuild gets a brand-new canvas: a lost WebGL context cannot be reused. */}
+      <canvas key={build} ref={canvas} />
       <Hud ref={hud} place={place} total={total} color={color} goAt={goAt} finalTimeMs={finalTimeMs} onPause={onPause} />
       <div className="hud">
         <Banner goAt={goAt} finished={finished} />
       </div>
-      {loading && <div className="loading caps">Loading track…</div>}
+      {loading && !broken && <div className="loading caps">Loading track…</div>}
+      {broken && (
+        <div className="overlay">
+          <div className="card">
+            <h2 className="caps">Graphics stopped</h2>
+            <p className="muted">The 3D view could not be restarted automatically. Your place in the room is kept.</p>
+            <div className="card-actions">
+              <button
+                className="btn btn--primary"
+                onClick={() => {
+                  rebuilds.current.count = 0;
+                  setBuild((n) => n + 1);
+                }}
+              >
+                Try again
+              </button>
+              <button className="btn" onClick={() => window.location.reload()}>
+                Reload page
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {children}
     </div>
   );

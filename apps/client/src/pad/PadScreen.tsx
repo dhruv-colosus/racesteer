@@ -3,6 +3,7 @@ import {
   CAR_COLORS,
   JoinError,
   Msg,
+  PAD_REPLACED,
   PAD_SEND_HZ,
   encodePadInput,
   ordinal,
@@ -15,9 +16,15 @@ import {
 import { describeJoinError, joinAsPad, type GameRoom } from '../net/client';
 import './pad.css';
 
-type Stage = 'intro' | 'connecting' | 'live' | 'reconnecting' | 'failed';
+/**
+ * intro: waiting for the first tap. connecting: first attempt. live: driving.
+ * reconnecting: lost the room, retrying by itself. replaced: another phone took
+ * this car. failed: gave up — the room or the link is gone.
+ */
+type Stage = 'intro' | 'connecting' | 'live' | 'reconnecting' | 'replaced' | 'failed';
 
 interface PadInfo {
+  practice: boolean;
   name: string;
   color: string;
   phase: string;
@@ -25,7 +32,11 @@ interface PadInfo {
   total: number;
 }
 
-const RETRY_MS = 1500;
+/** Retries start fast (a reload or a blip is back in well under a second) and slow down. */
+const RETRY_MIN_MS = 300;
+const RETRY_MAX_MS = 3000;
+/** Long enough to ride out a server restart or a walk through a dead spot; after that, stop and ask. */
+const GIVE_UP_MS = 90_000;
 /** If no motion reading arrives this long after starting, fall back to touch steering. */
 const MOTION_TIMEOUT_MS = 1500;
 /** Resend unchanged input this often so the display knows the phone is still there. */
@@ -39,6 +50,7 @@ interface MotionPermission {
 
 function statusLine(info: PadInfo | null): string {
   if (!info) return 'Connected';
+  if (info.practice) return 'Practice — you are driving';
   switch (info.phase) {
     case 'lobby':
       return 'Waiting for the race to start';
@@ -53,17 +65,42 @@ function statusLine(info: PadInfo | null): string {
   }
 }
 
+/** Remembers that this phone was already driving, so a reload goes straight back in without a tap. */
+const resumeKey = (code: string, token: string) => `tiltrush.pad.${code}.${token}`;
+function wasDriving(code: string, token: string): boolean {
+  try {
+    return sessionStorage.getItem(resumeKey(code, token)) === '1';
+  } catch {
+    return false;
+  }
+}
+function rememberDriving(code: string, token: string, on: boolean) {
+  try {
+    if (on) sessionStorage.setItem(resumeKey(code, token), '1');
+    else sessionStorage.removeItem(resumeKey(code, token));
+  } catch {
+    /* storage unavailable — a reload will just ask for a tap again */
+  }
+}
+
 /** The phone side: hold it like a wheel, tilt to steer, thumbs for the pedals. */
 export function PadScreen({ code, token }: { code: string; token: string }) {
-  const [stage, setStage] = useState<Stage>('intro');
+  const [stage, setStage] = useState<Stage>(() => (wasDriving(code, token) ? 'reconnecting' : 'intro'));
   const [error, setError] = useState('');
   const [info, setInfo] = useState<PadInfo | null>(null);
   const [touchSteer, setTouchSteer] = useState(false);
   const [tiltAvailable, setTiltAvailable] = useState(true);
+  /** Motion access needs a tap (iOS after a reload); until then the phone steers by touch. */
+  const [tiltNeedsTap, setTiltNeedsTap] = useState(false);
 
   const room = useRef<GameRoom | null>(null);
   const alive = useRef(true);
   const retryTimer = useRef(0);
+  const stageRef = useRef(stage);
+  stageRef.current = stage;
+  /** A join is in flight; never start a second one, or the two would take the car from each other. */
+  const joining = useRef(false);
+  const retry = useRef({ delay: RETRY_MIN_MS, since: 0 });
   const wakeLock = useRef<{ release(): Promise<void> } | null>(null);
 
   // Live control state lives in refs: it changes 60 times a second and never needs a React render.
@@ -77,18 +114,25 @@ export function PadScreen({ code, token }: { code: string; token: string }) {
 
   const connect = useCallback(async () => {
     window.clearTimeout(retryTimer.current);
+    if (joining.current || room.current || !alive.current) return;
+    joining.current = true;
+    if (!retry.current.since) retry.current.since = Date.now();
     try {
       const joined = await joinAsPad(code, token);
       if (!alive.current) {
         void joined.leave();
         return;
       }
+      // Reconnecting is handled here, by rejoining with the link: it is quicker than the SDK's seat-based retry.
+      joined.reconnection.enabled = false;
       room.current = joined;
+      retry.current = { delay: RETRY_MIN_MS, since: 0 };
       let playerId = '';
       const refresh = (state: RaceStateLike | undefined) => {
         const player = playerId ? state?.players?.get(playerId) : undefined;
         if (!state || !player) return;
         setInfo({
+          practice: state.practice === true,
           name: player.name,
           color: CAR_COLORS[player.color] ?? CAR_COLORS[0],
           phase: state.phase,
@@ -102,57 +146,96 @@ export function PadScreen({ code, token }: { code: string; token: string }) {
       });
       joined.onMessage(Msg.Haptic, (message: { ms: number }) => navigator.vibrate?.(message.ms));
       joined.onStateChange(refresh);
-      joined.onLeave(() => {
+      joined.onLeave((closeCode) => {
         if (!alive.current || room.current !== joined) return;
         room.current = null;
+        if (closeCode === PAD_REPLACED) {
+          // Another phone opened this link. Do not fight it for the car.
+          rememberDriving(code, token, false);
+          setStage('replaced');
+          return;
+        }
         setStage('reconnecting');
-        retryTimer.current = window.setTimeout(connect, RETRY_MS);
+        retryTimer.current = window.setTimeout(connect, RETRY_MIN_MS);
       });
+      rememberDriving(code, token, true);
       setError('');
       setStage('live');
     } catch (cause) {
       if (!alive.current) return;
       const failure = cause as { code?: number };
-      if (failure.code === JoinError.BadPadToken) {
-        // The player this link belonged to has gone. Nothing to retry.
-        setError(describeJoinError(cause));
+      setError(describeJoinError(cause));
+      // On a first connect a bad token is final: the link is stale. After that, the room or the
+      // driver may simply not be back yet (server restarting, display reloading), so keep trying for a while.
+      const staleLink = failure.code === JoinError.BadPadToken && stageRef.current === 'connecting';
+      if (staleLink || Date.now() - retry.current.since > GIVE_UP_MS) {
+        retry.current = { delay: RETRY_MIN_MS, since: 0 };
+        rememberDriving(code, token, false);
         setStage('failed');
         return;
       }
-      // Seat still held by a dropped connection, or the network is down: keep trying.
-      setError(describeJoinError(cause));
       setStage((current) => (current === 'connecting' ? 'connecting' : 'reconnecting'));
-      retryTimer.current = window.setTimeout(connect, RETRY_MS);
+      retryTimer.current = window.setTimeout(connect, retry.current.delay);
+      retry.current.delay = Math.min(RETRY_MAX_MS, retry.current.delay * 1.6);
+    } finally {
+      joining.current = false;
     }
   }, [code, token]);
 
+  /** Manual retry from the failed / replaced screens. */
+  const reconnectNow = () => {
+    retry.current = { delay: RETRY_MIN_MS, since: 0 };
+    setError('');
+    setStage('reconnecting');
+    void connect();
+  };
+
   // ---- sensors -------------------------------------------------------------
+
+  /**
+   * Turns tilt steering on. iOS only hands out motion data after a prompt,
+   * and only from a tap, so `fromTap` says whether this call is allowed to ask.
+   */
+  const enableTilt = async (fromTap: boolean) => {
+    const motion = window.DeviceMotionEvent as unknown as MotionPermission | undefined;
+    if (!window.DeviceMotionEvent) {
+      setTiltAvailable(false);
+      setTouchSteer(true);
+      return;
+    }
+    if (motion?.requestPermission) {
+      let granted = false;
+      let refused = false;
+      try {
+        const answer = await motion.requestPermission();
+        granted = answer === 'granted';
+        refused = !granted;
+      } catch {
+        // Asked without a tap (after a reload). Steer by touch and offer a button to ask properly.
+      }
+      if (!granted) {
+        setTouchSteer(true);
+        if (refused || fromTap) setTiltAvailable(false);
+        else setTiltNeedsTap(true);
+        return;
+      }
+    }
+    setTiltNeedsTap(false);
+    setTiltAvailable(true);
+    setTouchSteer(false);
+    window.removeEventListener('devicemotion', onMotion);
+    window.addEventListener('devicemotion', onMotion);
+    window.setTimeout(() => {
+      if (alive.current && !roll.current.seen) {
+        setTiltAvailable(false);
+        setTouchSteer(true);
+      }
+    }, MOTION_TIMEOUT_MS);
+  };
 
   const start = async () => {
     setStage('connecting');
-
-    // iOS only hands out motion data after an explicit prompt, and only from a tap.
-    let granted = true;
-    const motion = window.DeviceMotionEvent as unknown as MotionPermission | undefined;
-    if (motion?.requestPermission) {
-      try {
-        granted = (await motion.requestPermission()) === 'granted';
-      } catch {
-        granted = false;
-      }
-    }
-    if (!granted || !window.DeviceMotionEvent) {
-      setTiltAvailable(false);
-      setTouchSteer(true);
-    } else {
-      window.addEventListener('devicemotion', onMotion);
-      window.setTimeout(() => {
-        if (alive.current && !roll.current.seen) {
-          setTiltAvailable(false);
-          setTouchSteer(true);
-        }
-      }, MOTION_TIMEOUT_MS);
-    }
+    await enableTilt(true);
 
     void acquireWakeLock();
     // Best effort: Android honours these, iOS ignores them.
@@ -216,21 +299,40 @@ export function PadScreen({ code, token }: { code: string; token: string }) {
 
   useEffect(() => {
     alive.current = true;
-    const onVisible = () => {
-      if (document.visibilityState === 'visible' && wakeLock.current) void acquireWakeLock();
+
+    // This phone was already driving before the page reloaded: go straight back in, no tap needed.
+    if (stageRef.current === 'reconnecting') {
+      void enableTilt(false);
+      void acquireWakeLock();
+      void connect();
+    }
+
+    // Coming back from the lock screen, another app, or a dead spot: do not wait out the retry timer.
+    const wake = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (wakeLock.current || stageRef.current === 'live') void acquireWakeLock();
+      if (stageRef.current === 'reconnecting' || stageRef.current === 'connecting') {
+        retry.current.delay = RETRY_MIN_MS;
+        void connect();
+      }
     };
-    document.addEventListener('visibilitychange', onVisible);
+    document.addEventListener('visibilitychange', wake);
+    window.addEventListener('online', wake);
+    window.addEventListener('pageshow', wake);
     return () => {
       alive.current = false;
       window.clearTimeout(retryTimer.current);
       window.removeEventListener('devicemotion', onMotion);
-      document.removeEventListener('visibilitychange', onVisible);
+      document.removeEventListener('visibilitychange', wake);
+      window.removeEventListener('online', wake);
+      window.removeEventListener('pageshow', wake);
       void wakeLock.current?.release().catch(() => {});
       const active = room.current;
       room.current = null;
       void active?.leave().catch(() => {});
     };
-  }, [onMotion]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onMotion, connect]);
 
   // ---- touch controls ------------------------------------------------------
 
@@ -269,7 +371,7 @@ export function PadScreen({ code, token }: { code: string; token: string }) {
 
   // ---- render --------------------------------------------------------------
 
-  if (stage === 'intro' || stage === 'failed' || stage === 'connecting') {
+  if (stage === 'intro' || stage === 'failed' || stage === 'replaced' || stage === 'connecting') {
     return (
       <main className="pad-intro">
         <div className="pad-intro-title">
@@ -282,8 +384,18 @@ export function PadScreen({ code, token }: { code: string; token: string }) {
         <p className="caps muted">Room {code}</p>
         {stage === 'failed' ? (
           <>
-            <p className="toast caps">{error}</p>
-            <p className="muted">Open the room on the big screen and scan its code again.</p>
+            <p className="toast caps">{error || 'Lost the connection to the game.'}</p>
+            <button className="btn btn--primary pad-connect" onClick={reconnectNow}>
+              Try again
+            </button>
+            <p className="muted">If that does not work, open the room on the big screen and scan its code again.</p>
+          </>
+        ) : stage === 'replaced' ? (
+          <>
+            <p className="toast caps">Another phone took over this car.</p>
+            <button className="btn btn--primary pad-connect" onClick={reconnectNow}>
+              Use this phone
+            </button>
           </>
         ) : (
           <>
@@ -313,16 +425,22 @@ export function PadScreen({ code, token }: { code: string; token: string }) {
               Re-centre
             </button>
           )}
-          <button
-            className="btn btn--small"
-            disabled={!tiltAvailable}
-            onClick={() => {
-              controls.current.touchSteer = 0;
-              setTouchSteer((on) => !on);
-            }}
-          >
-            {touchSteer ? 'Touch steer' : 'Tilt steer'}
-          </button>
+          {tiltNeedsTap ? (
+            <button className="btn btn--small btn--primary" onClick={() => void enableTilt(true)}>
+              Enable tilt
+            </button>
+          ) : (
+            <button
+              className="btn btn--small"
+              disabled={!tiltAvailable}
+              onClick={() => {
+                controls.current.touchSteer = 0;
+                setTouchSteer((on) => !on);
+              }}
+            >
+              {touchSteer ? 'Touch steer' : 'Tilt steer'}
+            </button>
+          )}
         </div>
       </header>
 
@@ -347,7 +465,13 @@ export function PadScreen({ code, token }: { code: string; token: string }) {
             </div>
           </div>
           <span className="caps muted">
-            {touchSteer ? (tiltAvailable ? 'Drag to steer' : 'No motion sensor — drag to steer') : 'Tilt to steer'}
+            {touchSteer
+              ? tiltNeedsTap
+                ? 'Drag to steer — or tap Enable tilt'
+                : tiltAvailable
+                  ? 'Drag to steer'
+                  : 'No motion sensor — drag to steer'
+              : 'Tilt to steer'}
           </span>
         </div>
         <button className="pad-boost caps" aria-label="Boost" {...hold((down) => (controls.current.boost = down))}>

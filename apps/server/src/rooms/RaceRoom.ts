@@ -5,9 +5,13 @@ import {
   CAR_COLORS,
   FINISH_GRACE_MS,
   JoinError,
+  LOBBY_HOLD_SECONDS,
   MAX_PLAYERS_LIMIT,
   Msg,
+  PAD_REPLACED,
+  PAD_TOKEN_PATTERN,
   PATCH_RATE_MS,
+  RACE_HOLD_SECONDS,
   TRACKS,
   advanceProgress,
   buildTrackPath,
@@ -16,24 +20,25 @@ import {
   generateRoomCode,
   gridSlot,
   isFinished,
+  isRoomCode,
   newProgress,
   projectOnTrack,
   raceScore,
   rankPlayers,
   sanitizeName,
   sanitizeSettings,
+  uniqueName,
   sectorOf,
   type JoinOptions,
   type Phase,
   type RaceProgress,
   type RoomMetadata,
   type RoomSettings,
+  type SyncMessage,
   type TrackPath,
 } from '@racing/shared';
 import { Player, RaceState } from './schema';
 
-/** How long a dropped connection keeps its seat before the player is removed. */
-const RECONNECT_SECONDS = 12;
 /** Ride height the cars sit at on the grid — only cosmetic until the first real transform arrives. */
 const GRID_HEIGHT = 0.66;
 
@@ -64,6 +69,7 @@ export class RaceRoom extends Room<{ state: RaceState; metadata: RoomMetadata }>
   /** pad session → player session */
   private readonly playerOfPad = new Map<string, string>();
   private startedAt = 0;
+  private countdownAt = 0;
   private startTimer?: Delayed;
   private graceTimer?: Delayed;
 
@@ -71,13 +77,20 @@ export class RaceRoom extends Room<{ state: RaceState; metadata: RoomMetadata }>
     // Pads share the room with players, so the transport limit is twice the player limit.
     this.maxClients = MAX_PLAYERS_LIMIT * 2;
     this.patchRate = PATCH_RATE_MS;
-    this.roomId = await this.uniqueCode();
+    this.roomId = await this.claimCode((options as { code?: unknown } | null)?.code);
 
     const settings = sanitizeSettings(options);
+    const practice = (options as { practice?: unknown } | null)?.practice === true;
+    if (practice) {
+      // Solo practice: one seat, never listed. The room only pairs and relays a phone.
+      settings.isPrivate = true;
+      settings.maxPlayers = 1;
+    }
     const track = TRACKS[0]!;
     this.path = buildTrackPath(track);
     this.state = new RaceState().assign({
       phase: 'lobby',
+      practice,
       roomName: settings.roomName,
       maxPlayers: settings.maxPlayers,
       isPrivate: settings.isPrivate,
@@ -93,13 +106,29 @@ export class RaceRoom extends Room<{ state: RaceState; metadata: RoomMetadata }>
     this.onMessage(Msg.PadToken, (client) => this.sendPadToken(client));
     this.onMessage(Msg.Haptic, (client, message) => this.onHaptic(client, message));
     this.onMessage(Msg.Ready, (client) => this.onReady(client));
+    this.onMessage(Msg.Rename, (client, message) => this.onRename(client, message));
     this.onMessage(Msg.Settings, (client, message) => this.onSettings(client, message));
     this.onMessage(Msg.Start, (client) => this.onStart(client));
     this.onMessage(Msg.Rematch, (client) => this.onRematch(client));
+    this.onMessage(Msg.Sync, (client) => this.sendSync(client));
 
     this.clock.setInterval(() => {
       if (this.state.phase === 'racing') this.updatePlaces();
     }, 250);
+  }
+
+  /** A fault in one handler must not take the room, or the server, down with it. */
+  onUncaughtException(error: Error, method: string) {
+    console.error(`[room ${this.roomId}] error in ${method}:`, error);
+  }
+
+  /** A client bringing a room back after a server restart asks for the code everyone already has. */
+  private async claimCode(requested: unknown): Promise<string> {
+    if (typeof requested !== 'string' || !isRoomCode(requested)) return this.uniqueCode();
+    if ((await matchMaker.query({ roomId: requested })).length > 0) {
+      throw new ServerError(JoinError.CodeTaken, 'room code is in use');
+    }
+    return requested;
   }
 
   private async uniqueCode(): Promise<string> {
@@ -144,10 +173,11 @@ export class RaceRoom extends Room<{ state: RaceState; metadata: RoomMetadata }>
     this.state.players.set(
       client.sessionId,
       new Player().assign({
-        name: sanitizeName(options?.name),
+        name: this.freeName(sanitizeName(options?.name)),
         color,
         ready: false,
         pad: false,
+        connected: true,
         slot: 0,
         x: 0,
         y: GRID_HEIGHT,
@@ -167,7 +197,12 @@ export class RaceRoom extends Room<{ state: RaceState; metadata: RoomMetadata }>
     );
     if (!this.state.hostId) this.state.hostId = client.sessionId;
 
-    const token = randomBytes(9).toString('base64url');
+    // Keep the token this display had before if it can, so its phone stays paired.
+    const wanted = options?.padToken;
+    const token =
+      typeof wanted === 'string' && PAD_TOKEN_PATTERN.test(wanted) && !this.padTokens.has(wanted)
+        ? wanted
+        : randomBytes(9).toString('base64url');
     this.padTokens.set(token, client.sessionId);
     this.tokenOf.set(client.sessionId, token);
     this.publish();
@@ -178,8 +213,13 @@ export class RaceRoom extends Room<{ state: RaceState; metadata: RoomMetadata }>
     if (!playerId || !this.state.players.has(playerId)) {
       throw new ServerError(JoinError.BadPadToken, 'controller link is not valid');
     }
-    if (this.padOf.has(playerId)) {
-      throw new ServerError(JoinError.PadAlreadyConnected, 'a controller is already connected');
+    // The link is the key, so the newest phone to use it wins. This is what lets a
+    // phone that reloaded or lost signal walk straight back in, even if the server
+    // has not yet noticed its old connection is dead.
+    const previous = this.padOf.get(playerId);
+    if (previous) {
+      this.playerOfPad.delete(previous.sessionId);
+      previous.leave(PAD_REPLACED);
     }
     this.padOf.set(playerId, client);
     this.playerOfPad.set(client.sessionId, playerId);
@@ -190,12 +230,22 @@ export class RaceRoom extends Room<{ state: RaceState; metadata: RoomMetadata }>
   /** A connection dropped without saying goodbye: hold the seat for a moment in case it comes back. */
   onDrop(client: Client) {
     // A join we refused also arrives here; it never had a seat to hold.
-    if (!this.state.players.has(client.sessionId) && !this.playerOfPad.has(client.sessionId)) return;
+    // Phones are not held either: they rejoin with their link, which is quicker than waiting out a hold.
+    const player = this.state.players.get(client.sessionId);
+    if (!player) return;
     try {
-      this.allowReconnection(client, RECONNECT_SECONDS);
+      const hold = this.phase === 'lobby' ? LOBBY_HOLD_SECONDS : RACE_HOLD_SECONDS;
+      // Rejects when the hold runs out; onLeave then clears the seat.
+      this.allowReconnection(client, hold).catch(() => {});
+      player.connected = false;
     } catch {
       // Not eligible (never fully joined): onLeave runs straight away instead.
     }
+  }
+
+  onReconnect(client: Client) {
+    const player = this.state.players.get(client.sessionId);
+    if (player) player.connected = true;
   }
 
   onLeave(client: Client) {
@@ -250,8 +300,25 @@ export class RaceRoom extends Room<{ state: RaceState; metadata: RoomMetadata }>
     player.ready = !player.ready;
   }
 
+  /** Names in use by everyone except `except`. */
+  private freeName(name: string, except?: string): string {
+    const taken: string[] = [];
+    this.state.players.forEach((player, id) => {
+      if (id !== except) taken.push(player.name);
+    });
+    return uniqueName(name, taken);
+  }
+
+  private onRename(client: Client, message: unknown) {
+    const player = this.state.players.get(client.sessionId);
+    if (!player || this.phase !== 'lobby') return;
+    const raw = (message as { name?: unknown } | null)?.name;
+    if (typeof raw !== 'string' || !raw.trim()) return;
+    player.name = this.freeName(sanitizeName(raw), client.sessionId);
+  }
+
   private onSettings(client: Client, message: unknown) {
-    if (!this.isHost(client) || this.phase !== 'lobby') return;
+    if (!this.isHost(client) || this.phase !== 'lobby' || this.state.practice) return;
     const next = sanitizeSettings(message, this.settings());
     // Never shrink the room below the people already in it.
     next.maxPlayers = Math.max(next.maxPlayers, this.state.players.size);
@@ -262,7 +329,7 @@ export class RaceRoom extends Room<{ state: RaceState; metadata: RoomMetadata }>
   }
 
   private onStart(client: Client) {
-    if (!this.isHost(client) || this.phase !== 'lobby') return;
+    if (!this.isHost(client) || this.phase !== 'lobby' || this.state.practice) return;
     let everyoneReady = true;
     this.state.players.forEach((player, id) => {
       if (id !== this.state.hostId && !player.ready) everyoneReady = false;
@@ -286,6 +353,24 @@ export class RaceRoom extends Room<{ state: RaceState; metadata: RoomMetadata }>
   private sendPadToken(client: Client) {
     const token = this.tokenOf.get(client.sessionId);
     if (token) client.send(Msg.PadToken, { token });
+  }
+
+  /** Tells a display that has just (re)joined where the race stands, so it can pick it back up. */
+  private sendSync(client: Client) {
+    const player = this.state.players.get(client.sessionId);
+    if (!player) return;
+    const now = Date.now();
+    const goInMs =
+      this.phase === 'countdown' ? this.countdownAt + COUNTDOWN_MS - now : this.phase === 'racing' ? this.startedAt - now : null;
+    const sync: SyncMessage = {
+      phase: this.phase,
+      goInMs,
+      count: this.tracking.get(client.sessionId)?.progress.count ?? 0,
+      finished: player.finished,
+      x: player.x,
+      z: player.z,
+    };
+    client.send(Msg.Sync, sync);
   }
 
   private onPadInput(client: Client, message: unknown) {
@@ -314,7 +399,7 @@ export class RaceRoom extends Room<{ state: RaceState; metadata: RoomMetadata }>
         slot,
         ready: false,
         x: grid.x,
-        y: GRID_HEIGHT,
+        y: grid.y + GRID_HEIGHT,
         z: grid.z,
         qx: 0,
         qy: Math.sin(grid.heading / 2),
@@ -333,6 +418,7 @@ export class RaceRoom extends Room<{ state: RaceState; metadata: RoomMetadata }>
     });
 
     this.state.phase = 'countdown';
+    this.countdownAt = Date.now();
     this.broadcast(Msg.Countdown, { ms: COUNTDOWN_MS });
     this.startTimer?.clear();
     this.graceTimer?.clear();

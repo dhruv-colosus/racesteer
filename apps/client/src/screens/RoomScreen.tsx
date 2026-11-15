@@ -1,4 +1,3 @@
-import QRCode from 'qrcode';
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import {
   CAR_COLORS,
@@ -14,11 +13,17 @@ import {
   type Phase,
   type RaceStateLike,
   type RoomSettings,
+  type SyncMessage,
   type TransformMessage,
 } from '@racing/shared';
 import { describeJoinError, joinRoom, loadName, saveName, takeRoom, type GameRoom } from '../net/client';
-import { padLink, publicOrigin, roomLink } from '../net/links';
+import { CloseCode } from '@colyseus/sdk';
+import { RejoinRefused, clearSession, forgetToken, isCrashing, loadSession, rejoin, saveSession } from '../net/session';
+import { lanRoomLink, onTunnel, roomLink } from '../net/links';
+import { useLatency } from '../net/useLatency';
 import { navigate } from '../router';
+import { PhoneCard } from '../ui/PhoneCard';
+import { PingBadge } from '../ui/PingBadge';
 import { RaceStage, type StageHandle } from '../ui/RaceStage';
 
 interface Driver {
@@ -27,6 +32,7 @@ interface Driver {
   color: string;
   ready: boolean;
   pad: boolean;
+  connected: boolean;
   slot: number;
   place: number;
   finished: boolean;
@@ -55,6 +61,7 @@ function snapshotOf(state: RaceStateLike | undefined): Snapshot | null {
       color: CAR_COLORS[player.color] ?? CAR_COLORS[0],
       ready: player.ready,
       pad: player.pad,
+      connected: player.connected !== false,
       slot: player.slot,
       place: player.place,
       finished: player.finished,
@@ -73,16 +80,64 @@ function snapshotOf(state: RaceStateLike | undefined): Snapshot | null {
   };
 }
 
+type Link = 'live' | 'dropped' | 'recovering';
+
 export function RoomScreen({ code }: { code: string }) {
   const [room, setRoom] = useState<GameRoom | null>(() => takeRoom(code));
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  /** live: connected. dropped: the socket died and is being re-established. recovering: rejoining from scratch. */
+  const [link, setLink] = useState<Link>(() => (room === null && loadSession(code) ? 'recovering' : 'live'));
   const [gone, setGone] = useState<string | null>(null);
   const [padToken, setPadToken] = useState<string | null>(null);
   const [goAt, setGoAt] = useState<number | null>(null);
   const [menu, setMenu] = useState(false);
   const stage = useRef<StageHandle | null>(null);
-  const leaving = useRef(false);
   const lastHaptic = useRef(0);
+  const alive = useRef(true);
+  const recovering = useRef(false);
+  /** The game was just (re)built and has not yet been told where the race stands. */
+  const freshStage = useRef(false);
+  const latency = useLatency(room, link === 'live');
+  /** Hold our transforms back until the server's answer has put the car in the right place. */
+  const awaitingSync = useRef(false);
+
+  /**
+   * Gets back into the room after the connection is properly gone: a reload,
+   * a crash, a long network outage or a server restart. Reclaims the old seat
+   * if the server still holds it, otherwise rejoins, otherwise recreates the room.
+   */
+  const recover = useCallback(async () => {
+    if (recovering.current) return;
+    recovering.current = true;
+    setGone(null);
+    setLink('recovering');
+    try {
+      const next = await rejoin(() => loadSession(code), { cancelled: () => !alive.current });
+      setRoom(next);
+      setLink('live');
+    } catch (cause) {
+      if (!alive.current) return;
+      setGone(
+        cause instanceof RejoinRefused
+          ? cause.message
+          : 'Could not get back to the room. Check your connection and that the game server is running.',
+      );
+    } finally {
+      recovering.current = false;
+    }
+  }, [code]);
+
+  useEffect(() => {
+    alive.current = true;
+    // A saved session but no live room means this page was reloaded mid-session: go straight back in.
+    if (!room && loadSession(code)) void recover();
+    return () => {
+      alive.current = false;
+      // Leaving on purpose forgets the seat. A crash-reload keeps it.
+      if (!isCrashing()) clearSession(code);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [code]);
 
   /** Pushes everyone else's latest transform into the running game. */
   const feedRemotes = useCallback(
@@ -103,6 +158,9 @@ export function RoomScreen({ code }: { code: string }) {
 
   useEffect(() => {
     if (!room) return;
+    let closed = false;
+    saveSession(code, { code, token: room.reconnectionToken });
+
     let lastJson = '';
     const sync = (state: RaceStateLike) => {
       feedRemotes(state);
@@ -112,29 +170,70 @@ export function RoomScreen({ code }: { code: string }) {
       if (json === lastJson) return;
       lastJson = json;
       setSnapshot(next);
+      const me = next.drivers.find((driver) => driver.id === room.sessionId);
+      if (me) {
+        const { roomName, maxPlayers, isPrivate, laps } = next;
+        saveSession(code, { code, name: me.name, settings: { roomName, maxPlayers, isPrivate, laps } });
+      }
     };
     room.onStateChange(sync);
     if (room.state) sync(room.state);
 
-    const offToken = room.onMessage(Msg.PadToken, (message: { token: string }) => setPadToken(message.token));
+    const offToken = room.onMessage(Msg.PadToken, (message: { token: string }) => {
+      setPadToken(message.token);
+      saveSession(code, { code, padToken: message.token });
+    });
     const offCountdown = room.onMessage(Msg.Countdown, (message: { ms: number }) => setGoAt(performance.now() + message.ms));
+    const offSync = room.onMessage(Msg.Sync, (message: SyncMessage) => {
+      awaitingSync.current = false;
+      if (message.goInMs === null) return;
+      // Same clock the countdown message sets; only move it if it is actually off (we missed the countdown).
+      const at = performance.now() + message.goInMs;
+      setGoAt((current) => (current !== null && Math.abs(current - at) < 250 ? current : at));
+      if (freshStage.current && stage.current && message.phase === 'racing') {
+        stage.current.game.resume(message.x, message.z, message.count, message.finished);
+      }
+      freshStage.current = false;
+    });
     const offPad = room.onMessage(Msg.PadInput, (message: unknown) => {
       const input = decodePadInput(message);
       if (input) stage.current?.input.setPadInput(input);
     });
+
+    // The socket died. The SDK re-establishes it by itself; just say so meanwhile.
+    room.onDrop(() => {
+      if (!closed) setLink('dropped');
+    });
+    room.onReconnect(() => {
+      if (closed) return;
+      saveSession(code, { code, token: room.reconnectionToken });
+      setLink('live');
+      room.send(Msg.Sync);
+    });
+    // The SDK gave up, or the server ended the connection.
     room.onLeave((closeCode) => {
-      if (!leaving.current) setGone(closeCode === 4000 ? 'You left the room.' : 'Connection to the room was lost.');
+      if (closed) return;
+      if (closeCode === 4000) {
+        clearSession(code);
+        setGone('The room was closed.');
+      } else {
+        // The SDK's own retries were refused (or ran past any hold): the seat is gone, so go straight to rejoining.
+        if (closeCode === CloseCode.FAILED_TO_RECONNECT) forgetToken(room.reconnectionToken);
+        void recover();
+      }
     });
     room.send(Msg.PadToken);
+    room.send(Msg.Sync);
 
     return () => {
+      closed = true;
       offToken();
       offCountdown();
+      offSync();
       offPad();
-      leaving.current = true;
-      void room.leave().catch(() => {});
+      if (!isCrashing()) void room.leave().catch(() => {});
     };
-  }, [room, feedRemotes]);
+  }, [room, code, feedRemotes, recover]);
 
   const phase = snapshot?.phase;
   useEffect(() => {
@@ -154,7 +253,12 @@ export function RoomScreen({ code }: { code: string }) {
           <h2 className="caps">Disconnected</h2>
           <p className="muted">{gone}</p>
           <div className="card-actions">
-            <button className="btn btn--primary" onClick={leave}>
+            {loadSession(code) && (
+              <button className="btn btn--primary" onClick={() => void recover()}>
+                Try again
+              </button>
+            )}
+            <button className="btn" onClick={leave}>
               Back to menu
             </button>
           </div>
@@ -163,15 +267,37 @@ export function RoomScreen({ code }: { code: string }) {
     );
   }
 
-  if (!room) return <JoinGate code={code} onJoined={setRoom} />;
+  if (!room) {
+    if (link === 'recovering') return <div className="center-screen caps">Reconnecting to {code}…</div>;
+    return <JoinGate code={code} onJoined={setRoom} />;
+  }
   if (!snapshot) return <div className="center-screen caps">Joining {code}…</div>;
 
   const me = snapshot.drivers.find((driver) => driver.id === room.sessionId);
   if (!me) return <div className="center-screen caps">Joining {code}…</div>;
   const isHost = snapshot.hostId === room.sessionId;
+  const netBanner = link !== 'live' && (
+    <div className="net-banner caps" role="status">
+      Connection lost — reconnecting…
+    </div>
+  );
 
   if (snapshot.phase === 'lobby') {
-    return <Lobby room={room} code={code} snapshot={snapshot} me={me} isHost={isHost} padToken={padToken} onLeave={leave} />;
+    return (
+      <>
+        <Lobby
+          room={room}
+          code={code}
+          snapshot={snapshot}
+          me={me}
+          isHost={isHost}
+          padToken={padToken}
+          latency={latency}
+          onLeave={leave}
+        />
+        {netBanner}
+      </>
+    );
   }
 
   const showResults = snapshot.phase === 'finished' || me.finished;
@@ -188,8 +314,14 @@ export function RoomScreen({ code }: { code: string }) {
       onReady={(handle) => {
         stage.current = handle;
         feedRemotes(room.state);
+        // Ask where the race stands: if it is already under way (reload, rebuilt stage) the car is put back in it.
+        freshStage.current = true;
+        awaitingSync.current = true;
+        room.send(Msg.Sync);
       }}
-      onNet={(transform: TransformMessage) => room.send(Msg.Transform, transform)}
+      onNet={(transform: TransformMessage) => {
+        if (!awaitingSync.current) room.send(Msg.Transform, transform);
+      }}
       onImpact={(strength) => {
         const now = performance.now();
         if (!me.pad || now - lastHaptic.current < 250) return;
@@ -198,6 +330,8 @@ export function RoomScreen({ code }: { code: string }) {
       }}
       onPause={() => setMenu(true)}
     >
+      <PingBadge ms={latency} className="ping--hud" />
+      {netBanner}
       {showResults && (
         <Results
           snapshot={snapshot}
@@ -227,26 +361,46 @@ export function RoomScreen({ code }: { code: string }) {
   );
 }
 
-/** Shown when someone arrives by link: pick a name, then join. */
+/**
+ * Shown when someone arrives by link. With a name saved from before it joins
+ * straight away; otherwise (or if that join fails) it asks for a name first.
+ */
 function JoinGate({ code, onJoined }: { code: string; onJoined(room: GameRoom): void }) {
   const [name, setName] = useState(loadName);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  /** Joining on our own with the saved name; the form stays hidden meanwhile. */
+  const [auto, setAuto] = useState(() => loadName() !== '');
+  const tried = useRef(false);
 
-  const submit = async (event: FormEvent) => {
+  const join = useCallback(
+    async (who: string) => {
+      setBusy(true);
+      setError('');
+      saveName(who);
+      try {
+        onJoined(await joinRoom(code, sanitizeName(who)));
+      } catch (cause) {
+        setError(describeJoinError(cause));
+        setBusy(false);
+        setAuto(false);
+      }
+    },
+    [code, onJoined],
+  );
+
+  useEffect(() => {
+    if (!auto || tried.current) return;
+    tried.current = true;
+    void join(loadName());
+  }, [auto, join]);
+
+  const submit = (event: FormEvent) => {
     event.preventDefault();
-    if (busy) return;
-    setBusy(true);
-    setError('');
-    const clean = sanitizeName(name);
-    saveName(clean);
-    try {
-      onJoined(await joinRoom(code, clean));
-    } catch (cause) {
-      setError(describeJoinError(cause));
-      setBusy(false);
-    }
+    if (!busy) void join(name);
   };
+
+  if (auto) return <div className="center-screen caps">Joining {code}…</div>;
 
   return (
     <div className="center-screen">
@@ -288,36 +442,31 @@ interface LobbyProps {
   me: Driver;
   isHost: boolean;
   padToken: string | null;
+  latency: number | null;
   onLeave(): void;
 }
 
-function Lobby({ room, code, snapshot, me, isHost, padToken, onLeave }: LobbyProps) {
-  const [copied, setCopied] = useState(false);
-  const [qr, setQr] = useState<string | null>(null);
-  const link = padToken ? padLink(code, padToken) : null;
-  const usingLanDevOrigin = publicOrigin() !== window.location.origin;
-
-  useEffect(() => {
-    let cancelled = false;
-    setQr(null);
-    if (!link) return;
-    QRCode.toDataURL(link, { margin: 1, width: 336, errorCorrectionLevel: 'M' }).then(
-      (url) => !cancelled && setQr(url),
-      () => {},
-    );
-    return () => {
-      cancelled = true;
-    };
-  }, [link]);
-
-  const copy = async () => {
+function Lobby({ room, code, snapshot, me, isHost, padToken, latency, onLeave }: LobbyProps) {
+  const [copied, setCopied] = useState<'invite' | 'lan' | null>(null);
+  const copy = async (which: 'invite' | 'lan', link: string) => {
     try {
-      await navigator.clipboard.writeText(roomLink(code));
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
+      await navigator.clipboard.writeText(link);
+      setCopied(which);
+      window.setTimeout(() => setCopied(null), 1600);
     } catch {
-      window.prompt('Copy this link', roomLink(code));
+      window.prompt('Copy this link', link);
     }
+  };
+  // With `pnpm dev:tunnel` running, a laptop on the host's Wi-Fi is far better off
+  // talking to the host directly than going out to Cloudflare and back.
+  const lanLink = lanRoomLink(code);
+  const switchToLan = () => {
+    if (!lanLink) return;
+    clearSession(code);
+    window.location.assign(lanLink);
+    // Give the seat up now, rather than leaving a "Reconnecting…" ghost in everyone's lobby.
+    // Alone in the room, leaving would close it; dropping instead keeps it for the lobby hold.
+    if (snapshot.drivers.length > 1) void room.leave().catch(() => {});
   };
 
   const change = (settings: Partial<RoomSettings>) => room.send(Msg.Settings, settings);
@@ -333,14 +482,32 @@ function Lobby({ room, code, snapshot, me, isHost, padToken, onLeave }: LobbyPro
           <h1 className="caps">{snapshot.roomName}</h1>
         </div>
         <div className="lobby-code">
+          <PingBadge ms={latency} />
           <div className="slab slab--accent caps" aria-label={`Room code ${code}`}>
             {code}
           </div>
-          <button className="btn" onClick={copy}>
-            {copied ? 'Copied!' : 'Copy invite link'}
+          {lanLink && (
+            <button className="btn" onClick={() => void copy('lan', lanLink)} title={lanLink}>
+              {copied === 'lan' ? 'Copied!' : 'Copy same Wi-Fi link'}
+            </button>
+          )}
+          <button className="btn" onClick={() => void copy('invite', roomLink(code))} title={roomLink(code)}>
+            {copied === 'invite' ? 'Copied!' : lanLink ? 'Copy any-network link' : 'Copy invite link'}
           </button>
         </div>
       </header>
+
+      {lanLink && onTunnel() && (
+        <div className="lan-hint" role="note">
+          <p>
+            <b className="caps">Same Wi-Fi as the host?</b> You came in through the internet tunnel, so every update
+            travels out to Cloudflare and back. Switch to the direct link for a much lower ping.
+          </p>
+          <button className="btn btn--small" onClick={switchToLan} title={lanLink}>
+            Switch to direct link
+          </button>
+        </div>
+      )}
 
       <div className="lobby-grid">
         <section className="pane">
@@ -354,8 +521,13 @@ function Lobby({ room, code, snapshot, me, isHost, padToken, onLeave }: LobbyPro
             {snapshot.drivers.map((driver) => (
               <li className="driver" key={driver.id}>
                 <span className="driver-swatch" style={{ background: driver.color }} />
-                <span className="driver-name caps">{driver.name}</span>
+                {driver.id === me.id ? (
+                  <NameEditor name={driver.name} onRename={(name) => room.send(Msg.Rename, { name })} />
+                ) : (
+                  <span className="driver-name caps">{driver.name}</span>
+                )}
                 {driver.id === me.id && <span className="tag">You</span>}
+                {!driver.connected && <span className="tag tag--warn">Reconnecting…</span>}
                 {driver.pad && <span className="tag tag--cyan">Phone</span>}
                 {driver.id === snapshot.hostId ? (
                   <span className="tag tag--accent">Host</span>
@@ -391,26 +563,7 @@ function Lobby({ room, code, snapshot, me, isHost, padToken, onLeave }: LobbyPro
         <div style={{ display: 'flex', flexDirection: 'column', gap: 20, minWidth: 0 }}>
           <section className={`pane${me.pad ? ' phone--connected' : ''}`}>
             <h2 className="caps">{me.pad ? 'Phone connected' : 'Connect your phone'}</h2>
-            <div className="phone">
-              {!me.pad && (qr ? <img src={qr} alt="QR code that opens the controller on your phone" /> : <div style={{ width: 168, height: 168 }} />)}
-              <div className="phone-text">
-                {me.pad ? (
-                  <p>Hold it sideways like a steering wheel. Tilt to steer, right thumb for gas, left thumb for brake.</p>
-                ) : (
-                  <>
-                    <p>Scan with your phone camera. It becomes your steering wheel: tilt to steer, thumbs for gas and brake.</p>
-                    {link && <span className="phone-link">{link}</span>}
-                    {usingLanDevOrigin && (
-                      <p className="muted">
-                        Dev build: the phone must be on the same Wi-Fi, and will show a certificate warning once — choose to
-                        proceed.
-                      </p>
-                    )}
-                    <p className="muted">No phone? Drive with WASD or the arrow keys.</p>
-                  </>
-                )}
-              </div>
-            </div>
+            <PhoneCard code={code} token={padToken} connected={me.pad} />
           </section>
 
           <section className="pane">
@@ -494,6 +647,55 @@ function Lobby({ room, code, snapshot, me, isHost, padToken, onLeave }: LobbyPro
         </div>
       </div>
     </main>
+  );
+}
+
+/** Your own name in the lobby list: click it (or the pencil) to change it. */
+function NameEditor({ name, onRename }: { name: string; onRename(name: string): void }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(name);
+
+  const open = () => {
+    setDraft(name);
+    setEditing(true);
+  };
+  const commit = () => {
+    setEditing(false);
+    const clean = draft.trim();
+    if (!clean || clean === name) return;
+    saveName(clean);
+    onRename(clean);
+  };
+
+  if (editing) {
+    return (
+      <form
+        className="driver-name"
+        onSubmit={(event) => {
+          event.preventDefault();
+          commit();
+        }}
+      >
+        <input
+          className="input input--name"
+          value={draft}
+          maxLength={NAME_MAX_LENGTH}
+          aria-label="Your driver name"
+          autoFocus
+          onFocus={(event) => event.target.select()}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={commit}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape') setEditing(false);
+          }}
+        />
+      </form>
+    );
+  }
+  return (
+    <button type="button" className="driver-name driver-name--edit caps" onClick={open} title="Change your name">
+      {name} <span className="driver-name-pencil" aria-hidden="true">✎</span>
+    </button>
   );
 }
 

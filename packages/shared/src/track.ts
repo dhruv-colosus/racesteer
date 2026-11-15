@@ -1,6 +1,6 @@
 /**
- * Tracks are data: a closed loop of control points on the ground plane (x, z)
- * plus a width. Everything else — road mesh, walls, checkpoints, start grid,
+ * Tracks are data: a closed loop of control points (x, z, and an optional
+ * elevation y) plus a width. Everything else — road mesh, walls, checkpoints, start grid,
  * minimap — is derived from the sampled path, on the client and the server.
  *
  * Axes follow three.js: Y is up, the ground is the XZ plane.
@@ -12,11 +12,26 @@ export interface TrackDef {
   name: string;
   /** Drivable width in metres. */
   width: number;
-  /** Closed loop of control points, in driving order. The start line sits on the first one. */
-  points: readonly (readonly [number, number])[];
+  /**
+   * Closed loop of control points `[x, z, y?]`, in driving order. The start
+   * line sits on the first one. `y` is the road's elevation in metres (default 0).
+   */
+  points: readonly (readonly [x: number, z: number, y?: number])[];
   /** Number of equal sectors used to validate laps. */
   sectors: number;
+  /** Speed pads on the road surface. */
+  boostPads?: readonly BoostPadDef[];
 }
+
+export interface BoostPadDef {
+  /** Where the pad starts, as a fraction of the lap (0..1). */
+  at: number;
+  /** Offset of the pad's centre from the centre line; positive is right of travel. */
+  lateral: number;
+}
+
+/** Size of a boost pad on the road, in metres. */
+export const BOOST_PAD = { length: 12, width: 6 } as const;
 
 export interface TrackPath {
   def: TrackDef;
@@ -28,7 +43,11 @@ export interface TrackPath {
   step: number;
   x: Float32Array;
   z: Float32Array;
-  /** Unit tangent (direction of travel). */
+  /** Road elevation. */
+  y: Float32Array;
+  /** Slope along the direction of travel (rise over run); positive is uphill. */
+  grade: Float32Array;
+  /** Unit tangent (direction of travel), flattened onto the ground plane. */
   tx: Float32Array;
   tz: Float32Array;
 }
@@ -59,6 +78,7 @@ export function buildTrackPath(def: TrackDef, spacing = 2): TrackPath {
   // Dense pass.
   const perSegment = 48;
   const dense: number[] = [];
+  const denseY: number[] = [];
   for (let i = 0; i < count; i++) {
     const p0 = pts[mod(i - 1, count)]!;
     const p1 = pts[i]!;
@@ -67,6 +87,7 @@ export function buildTrackPath(def: TrackDef, spacing = 2): TrackPath {
     for (let k = 0; k < perSegment; k++) {
       const t = k / perSegment;
       dense.push(catmullRom(p0[0], p1[0], p2[0], p3[0], t), catmullRom(p0[1], p1[1], p2[1], p3[1], t));
+      denseY.push(catmullRom(p0[2] ?? 0, p1[2] ?? 0, p2[2] ?? 0, p3[2] ?? 0, t));
     }
   }
   const dn = dense.length / 2;
@@ -82,6 +103,7 @@ export function buildTrackPath(def: TrackDef, spacing = 2): TrackPath {
   const step = length / n;
   const x = new Float32Array(n);
   const z = new Float32Array(n);
+  const y = new Float32Array(n);
   let seg = 0;
   for (let i = 0; i < n; i++) {
     const target = i * step;
@@ -92,10 +114,12 @@ export function buildTrackPath(def: TrackDef, spacing = 2): TrackPath {
     const f = span > 0 ? (target - cum[seg]!) / span : 0;
     x[i] = dense[a * 2]! + (dense[b * 2]! - dense[a * 2]!) * f;
     z[i] = dense[a * 2 + 1]! + (dense[b * 2 + 1]! - dense[a * 2 + 1]!) * f;
+    y[i] = denseY[a]! + (denseY[b]! - denseY[a]!) * f;
   }
 
   const tx = new Float32Array(n);
   const tz = new Float32Array(n);
+  const grade = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     const a = mod(i - 1, n);
     const b = (i + 1) % n;
@@ -104,9 +128,10 @@ export function buildTrackPath(def: TrackDef, spacing = 2): TrackPath {
     const len = Math.hypot(dx, dz) || 1;
     tx[i] = dx / len;
     tz[i] = dz / len;
+    grade[i] = (y[b]! - y[a]!) / len;
   }
 
-  return { def, length, n, step, x, z, tx, tz };
+  return { def, length, n, step, x, z, y, grade, tx, tz };
 }
 
 /**
@@ -147,9 +172,20 @@ export function projectOnTrack(path: TrackPath, px: number, pz: number, hint = -
   return { index: best, s: mod(best * step + along, length), lateral };
 }
 
+export interface TrackPoint {
+  x: number;
+  /** Road surface elevation. */
+  y: number;
+  z: number;
+  /** Yaw that turns +Z onto the travel direction. */
+  heading: number;
+  /** Slope along the direction of travel (rise over run). */
+  grade: number;
+}
+
 /** World position and heading for a point `s` metres along the track, offset `lateral` to the right. */
-export function pointOnTrack(path: TrackPath, s: number, lateral = 0): { x: number; z: number; heading: number } {
-  const { n, step, x, z, tx, tz } = path;
+export function pointOnTrack(path: TrackPath, s: number, lateral = 0): TrackPoint {
+  const { n, step, x, y, z, tx, tz, grade } = path;
   const f = mod(s, path.length) / step;
   const i = Math.floor(f) % n;
   const j = (i + 1) % n;
@@ -161,14 +197,15 @@ export function pointOnTrack(path: TrackPath, s: number, lateral = 0): { x: numb
   const uz = dirZ / len;
   return {
     x: x[i]! + (x[j]! - x[i]!) * t + -uz * lateral,
+    y: y[i]! + (y[j]! - y[i]!) * t,
     z: z[i]! + (z[j]! - z[i]!) * t + ux * lateral,
-    // Heading is the yaw that turns +Z onto the travel direction.
     heading: Math.atan2(ux, uz),
+    grade: grade[i]! + (grade[j]! - grade[i]!) * t,
   };
 }
 
 /** Start-grid slot: two cars per row, staggered, behind the start line. */
-export function gridSlot(path: TrackPath, slot: number): { x: number; z: number; heading: number } {
+export function gridSlot(path: TrackPath, slot: number): TrackPoint {
   const row = Math.floor(slot / 2);
   const side = slot % 2 === 0 ? -1 : 1;
   const back = 8 + row * 9 + (side > 0 ? 3 : 0);
@@ -179,34 +216,55 @@ export const TRACKS: readonly TrackDef[] = [
   {
     id: 'harbor-loop',
     name: 'Harbor Loop',
-    width: 16,
+    width: 20,
     sectors: 24,
     points: [
-      // Main straight, heading +X. Start line on the first point.
-      [-40, 0],
-      [60, 0],
-      [150, 0],
-      // Long right-hander
-      [215, 30],
-      [240, 90],
-      [220, 150],
-      [165, 180],
-      // Back section: left kink, then a climb out to the far corner
-      [85, 155],
-      [5, 185],
-      [-65, 240],
-      [-150, 245],
-      // Sweeping right into the esses
-      [-210, 215],
-      [-232, 160],
-      [-216, 112],
-      [-222, 66],
-      [-192, 26],
+      // Main straight, heading +X. Start line on the first point. Flat for the grid, then a dip and a crest.
+      [-60, 0, 0],
+      [90, 0, -2.1],
+      [225, 0, 4.2],
+      // Long right-hander, climbing
+      [322, 45, 9.8],
+      [360, 135, 15.4],
+      [330, 225, 18.2],
+      [248, 270, 14],
+      // Back section: drop into the left kink, kick over a crest, then climb to the far corner
+      [128, 232, 2.8],
+      [8, 278, 12.6],
+      [-98, 360, 19.6],
+      [-225, 368, 23.8],
+      // Sweeping right and plunging down into the esses
+      [-315, 322, 16.8],
+      [-348, 240, 7],
+      [-324, 168, 1.4],
+      [-333, 99, 5.6],
+      [-288, 39, 1.4],
       // Back onto the straight
-      [-140, 0],
+      [-210, 0, 0],
+    ],
+    boostPads: [
+      { at: 0.045, lateral: 0 },
+      { at: 0.105, lateral: -4.5 },
+      { at: 0.31, lateral: 4 },
+      { at: 0.405, lateral: -3 },
+      { at: 0.53, lateral: 3.5 },
+      { at: 0.635, lateral: 0 },
+      { at: 0.945, lateral: -3 },
     ],
   },
 ];
+
+/** Index of the boost pad under a point on the track, or -1. */
+export function boostPadAt(path: TrackPath, s: number, lateral: number): number {
+  const pads = path.def.boostPads;
+  if (!pads) return -1;
+  for (let i = 0; i < pads.length; i++) {
+    const pad = pads[i]!;
+    const into = mod(s - pad.at * path.length, path.length);
+    if (into <= BOOST_PAD.length && Math.abs(lateral - pad.lateral) <= BOOST_PAD.width / 2) return i;
+  }
+  return -1;
+}
 
 export function getTrack(id: string): TrackDef {
   return TRACKS.find((t) => t.id === id) ?? TRACKS[0]!;

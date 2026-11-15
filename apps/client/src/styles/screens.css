@@ -1,6 +1,5 @@
 /* Menus: home, lobby, results. */
 
-.home,
 .lobby {
   height: 100%;
   overflow: auto;
@@ -10,36 +9,455 @@
     radial-gradient(120% 90% at 80% 0%, #1b2740 0%, var(--ink) 60%);
 }
 
+/* ---- home: title screen --------------------------------------------------- */
+
+.home {
+  position: relative;
+  isolation: isolate;
+  height: 100%;
+  overflow: hidden auto;
+  display: flex;
+  flex-direction: column;
+  padding: max(16px, env(safe-area-inset-top)) clamp(16px, 3vw, 40px) max(14px, env(safe-area-inset-bottom));
+  background: radial-gradient(90% 70% at 50% 38%, #1d2a47 0%, var(--ink) 72%);
+}
+
+/* Backdrop: leaning speed streaks above a road grid that rushes toward the viewer. */
+.home-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+}
+.home-backdrop::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(60% 22% at 50% 62%, rgba(255, 45, 120, 0.22), transparent 70%),
+    radial-gradient(120% 100% at 50% 45%, transparent 55%, rgba(5, 7, 13, 0.85) 100%);
+}
+.home-streaks {
+  position: absolute;
+  inset: -20% -40%;
+  transform: skewX(var(--skew));
+  background:
+    linear-gradient(90deg, transparent 0 18%, rgba(255, 45, 120, 0.13) 18% 21%, transparent 21% 23%, rgba(248, 250, 252, 0.05) 23% 24%, transparent 24%),
+    linear-gradient(90deg, transparent 0 74%, rgba(34, 211, 238, 0.07) 74% 75%, transparent 75% 78%, rgba(255, 45, 120, 0.1) 78% 82%, transparent 82%);
+  animation: streak-drift 14s ease-in-out infinite alternate;
+}
+.home-floor {
+  position: absolute;
+  left: -50%;
+  right: -50%;
+  top: 62%;
+  height: 90%;
+  transform-origin: 50% 0;
+  transform: perspective(420px) rotateX(74deg);
+  background-image:
+    linear-gradient(rgba(255, 45, 120, 0.5) 0 2px, transparent 2px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.28) 0 2px, transparent 2px);
+  background-size: 100% 64px, 96px 100%;
+  background-position: 0 0, 50% 0;
+  mask-image: linear-gradient(180deg, transparent 0, #000 22%, transparent 95%);
+  -webkit-mask-image: linear-gradient(180deg, transparent 0, #000 22%, transparent 95%);
+  opacity: 0.55;
+  animation: floor-rush 0.9s linear infinite;
+}
+@keyframes floor-rush {
+  to {
+    background-position: 0 64px, 50% 0;
+  }
+}
+@keyframes streak-drift {
+  to {
+    transform: skewX(var(--skew)) translateX(4%);
+  }
+}
+
+.home-bar,
+.home-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  flex-wrap: wrap;
+}
+.home-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.95rem;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+}
+.home-status i {
+  width: 10px;
+  height: 10px;
+  background: var(--good);
+  transform: skewX(var(--skew));
+  box-shadow: 0 0 10px var(--good);
+}
+.home-status--down i {
+  background: var(--warn);
+  box-shadow: 0 0 10px var(--warn);
+}
+
+/* Driver name tag, styled like a number plate. */
+.plate {
+  display: flex;
+  align-items: stretch;
+  height: 42px;
+  box-shadow: inset 0 0 0 2px var(--line);
+  background: rgba(11, 15, 26, 0.7);
+  transition: box-shadow 0.12s ease;
+}
+.plate:focus-within {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.plate span {
+  display: grid;
+  place-items: center;
+  padding: 0 14px;
+  background: var(--accent);
+  font-size: 0.95rem;
+  letter-spacing: 0.12em;
+}
+.plate input {
+  width: 190px;
+  min-width: 0;
+  padding: 0 14px;
+  border: 0;
+  outline: none;
+  background: none;
+  font-size: 1.2rem;
+  font-weight: 700;
+}
+
+.home-center {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: clamp(20px, 4.5vh, 44px);
+  width: 100%;
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: clamp(16px, 3vh, 32px) 0;
+}
+
+.home-logo {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  animation: rise 0.5s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
 .home-title {
   display: flex;
   align-items: stretch;
-  gap: 16px;
-  height: clamp(54px, 9vw, 96px);
+  gap: clamp(10px, 1.6vw, 18px);
+  height: clamp(50px, 8.2vw, 104px);
 }
 .home-title h1 {
   margin: 0;
-  font-size: clamp(3.2rem, 9vw, 6rem);
+  font-size: clamp(3.1rem, 9vw, 6.6rem);
   line-height: 0.95;
   white-space: nowrap;
+  text-shadow: 0 6px 0 rgba(0, 0, 0, 0.35), 0 0 46px rgba(255, 45, 120, 0.35);
 }
 .home-title .stripes i {
-  width: clamp(18px, 3vw, 34px);
+  width: clamp(16px, 2.8vw, 34px);
 }
 .home-title .stripes i:nth-child(2) {
-  width: clamp(8px, 1.4vw, 16px);
+  width: clamp(7px, 1.3vw, 16px);
 }
 .home-tag {
-  margin: 10px 0 clamp(18px, 4vh, 36px);
+  margin: clamp(10px, 1.6vh, 16px) 0 0;
   color: var(--muted);
-  font-size: clamp(1rem, 2.2vw, 1.35rem);
+  font-size: clamp(0.95rem, 1.9vw, 1.25rem);
+  letter-spacing: 0.14em;
 }
 
-.home-grid {
+.menu {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
-  gap: 20px;
+  grid-template-columns: minmax(250px, 320px) minmax(0, 1fr);
+  gap: clamp(16px, 2.4vw, 30px);
   align-items: start;
-  max-width: 1240px;
+  width: 100%;
+  max-width: 920px;
+}
+.menu-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 10px;
+  animation: rise 0.5s 0.08s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+.menu-item {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 76px;
+  padding: 10px 22px;
+  border: 0;
+  background: none;
+  text-align: left;
+  cursor: pointer;
+  transition: transform 0.16s cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+.menu-item::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  transform: skewX(var(--skew));
+  background: rgba(30, 41, 59, 0.6);
+  box-shadow: inset 0 0 0 2px var(--line);
+  transition: background 0.16s ease;
+}
+.menu-item:hover::before {
+  background: var(--panel-hi);
+}
+.menu-item:focus-visible {
+  outline: none;
+}
+.menu-item:focus-visible::before {
+  box-shadow: inset 0 0 0 3px var(--cyan);
+}
+.menu-item--active {
+  transform: translateX(12px);
+}
+.menu-item--active::before,
+.menu-item--active:hover::before {
+  background: linear-gradient(180deg, var(--accent), var(--accent-deep));
+  box-shadow: 0 10px 30px rgba(255, 45, 120, 0.3);
+}
+.menu-index {
+  font-style: italic;
+  font-weight: 800;
+  font-size: 1.1rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.menu-item--active .menu-index {
+  color: rgba(255, 255, 255, 0.75);
+}
+.menu-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.menu-text strong {
+  font-size: 1.7rem;
+  line-height: 1.05;
+}
+.menu-text small {
+  font-size: 0.92rem;
+  font-weight: 500;
+  color: var(--muted);
+}
+.menu-item--active .menu-text small {
+  color: rgba(255, 255, 255, 0.85);
+}
+.menu-badge {
+  display: grid;
+  place-items: center;
+  min-width: 30px;
+  height: 30px;
+  padding: 0 8px;
+  background: var(--cyan);
+  color: #083344;
+  font-size: 1rem;
+  transform: skewX(var(--skew));
+}
+
+.menu-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 452px;
+  min-width: 0;
+  padding: 22px 28px 14px;
+  background: rgba(22, 31, 48, 0.88);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-left: 6px solid var(--accent);
+  clip-path: polygon(0 0, calc(100% - 30px) 0, 100% 30px, 100% 100%, 0 100%);
+  animation: panel-in 0.26s cubic-bezier(0.2, 0.9, 0.3, 1) both;
+}
+.menu-kicker {
+  margin: 0 0 4px;
+  font-size: 0.95rem;
+  letter-spacing: 0.16em;
+  color: var(--muted);
+}
+.menu-form {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.menu-form h2 {
+  margin: 0 0 2px;
+  font-size: 2.2rem;
+  line-height: 1;
+}
+.menu-form h3 {
+  margin: 4px 0 -6px;
+  font-size: 1rem;
+  letter-spacing: 0.12em;
+}
+.menu-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 16px 28px;
+}
+.btn--go {
+  margin-top: auto;
+  min-height: 58px;
+  font-size: 1.5rem;
+}
+.menu-panel .toast {
+  margin: 8px 0 0;
+}
+.link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--cyan);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.keys {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+}
+.keys > div {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+.keys dt {
+  display: flex;
+  gap: 5px;
+  min-width: 152px;
+}
+.keys dd {
+  margin: 0;
+  font-weight: 500;
+  color: var(--muted);
+}
+kbd {
+  display: inline-grid;
+  place-items: center;
+  min-width: 32px;
+  height: 32px;
+  padding: 0 8px;
+  font: inherit;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text);
+  background: var(--panel-hi);
+  box-shadow: inset 0 -3px 0 rgba(0, 0, 0, 0.35), inset 0 0 0 1px var(--line);
+}
+.kbd--wide {
+  min-width: 84px;
+}
+
+.home-foot {
+  font-size: 0.9rem;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+}
+.home-foot span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.home-foot kbd {
+  min-width: 26px;
+  height: 26px;
+  font-style: normal;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+}
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateX(18px);
+  }
+}
+
+@media (max-width: 760px) {
+  .menu {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .menu-nav {
+    flex-direction: row;
+    gap: 6px;
+    padding: 0 6px;
+  }
+  .menu-item {
+    flex: 1;
+    min-height: 54px;
+    padding: 8px 6px;
+    justify-content: center;
+    text-align: center;
+  }
+  .menu-item--active {
+    transform: none;
+  }
+  .menu-index,
+  .menu-text small,
+  .home-foot span:first-child {
+    display: none;
+  }
+  .menu-text strong {
+    font-size: 1.05rem;
+  }
+  .menu-badge {
+    position: absolute;
+    top: -8px;
+    right: 2px;
+    min-width: 22px;
+    height: 22px;
+    font-size: 0.8rem;
+  }
+  .menu-panel {
+    min-height: 0;
+    padding: 18px 18px 10px;
+  }
+  .home-foot {
+    justify-content: center;
+    text-align: center;
+  }
+  .plate input {
+    width: 130px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .home-floor,
+  .home-streaks,
+  .home-logo,
+  .menu-nav,
+  .menu-panel {
+    animation: none;
+  }
 }
 
 .pane {
@@ -164,6 +582,29 @@
   padding: 8px 26px 8px 34px;
 }
 
+/* Shown to a laptop that joined through the dev tunnel while a direct LAN link exists. */
+.lan-hint {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  max-width: 1240px;
+  margin-bottom: 20px;
+  padding: 14px 18px;
+  background: var(--panel);
+  border-left: 6px solid var(--warn);
+}
+.lan-hint p {
+  margin: 0;
+  flex: 1 1 320px;
+  color: var(--muted);
+}
+.lan-hint b {
+  color: var(--text);
+  margin-right: 6px;
+}
+
 .lobby-grid {
   display: grid;
   grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
@@ -206,6 +647,29 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.driver-name--edit {
+  display: block;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 1.4rem;
+  text-align: left;
+  cursor: text;
+}
+.driver-name-pencil {
+  font-size: 1rem;
+  opacity: 0.45;
+}
+.driver-name--edit:hover .driver-name-pencil,
+.driver-name--edit:focus-visible .driver-name-pencil {
+  opacity: 1;
+}
+.input--name {
+  min-height: 36px;
+  padding: 4px 10px;
+}
 .driver--empty {
   color: var(--muted);
   border: 2px dashed var(--line);
@@ -225,6 +689,10 @@
 }
 .tag--accent {
   background: var(--accent);
+}
+.tag--warn {
+  background: #facc15;
+  color: #422006;
 }
 .tag--cyan {
   background: var(--cyan);
@@ -253,6 +721,16 @@
   background: #fff;
   padding: 6px;
   image-rendering: pixelated;
+}
+.phone-qr-placeholder {
+  width: 168px;
+  height: 168px;
+  background: rgba(11, 15, 26, 0.5);
+}
+.phone code {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
 }
 .phone-text {
   flex: 1;
@@ -316,4 +794,78 @@
   place-items: center;
   padding: 24px;
   background: radial-gradient(120% 90% at 80% 0%, #1b2740 0%, var(--ink) 60%);
+}
+
+/* Shown over the lobby or the race while the connection is being re-established. */
+.net-banner {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  padding: 6px 18px;
+  font-size: 1rem;
+  letter-spacing: 0.08em;
+  background: #facc15;
+  color: #422006;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}
+
+/* ---- server latency ------------------------------------------------------ */
+
+.ping {
+  --ping: var(--muted);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 12px;
+  background: rgba(11, 15, 26, 0.72);
+  border: 2px solid var(--line);
+  font-size: 1.05rem;
+  line-height: 1;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.ping b {
+  font-weight: 800;
+  font-style: italic;
+  font-variant-numeric: tabular-nums;
+  min-width: 2.2ch;
+  text-align: right;
+  color: var(--ping);
+}
+.ping small {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+.ping-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+  align-self: center;
+}
+.ping-bars i {
+  display: block;
+  width: 4px;
+  background: rgba(148, 163, 184, 0.35);
+}
+.ping-bars i:nth-child(1) { height: 5px; }
+.ping-bars i:nth-child(2) { height: 9px; }
+.ping-bars i:nth-child(3) { height: 14px; }
+.ping--good { --ping: #4ade80; }
+.ping--fair { --ping: #facc15; }
+.ping--poor { --ping: #f87171; }
+.ping--good .ping-bars i,
+.ping--fair .ping-bars i:nth-child(-n + 2),
+.ping--poor .ping-bars i:nth-child(1) {
+  background: var(--ping);
+}
+/* In the race: next to the pause button, clear of the countdown banner and the chips. */
+.ping--hud {
+  position: absolute;
+  z-index: 5;
+  top: max(24px, env(safe-area-inset-top));
+  left: max(80px, calc(env(safe-area-inset-left) + 58px));
 }

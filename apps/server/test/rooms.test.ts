@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   JoinError,
   Msg,
+  PAD_REPLACED,
   ROOM_NAME,
   TRACKS,
   buildTrackPath,
@@ -12,6 +13,7 @@ import {
   type PadInputMessage,
   type RaceStateLike,
   type RoomListing,
+  type SyncMessage,
 } from '@racing/shared';
 import { startServer } from '../src/app';
 
@@ -138,6 +140,22 @@ describe('rooms', () => {
     expect(a.color).not.toBe(b.color);
   });
 
+  it('keeps names unique and lets drivers rename in the lobby', async () => {
+    const host = await create('');
+    const guest = await join(host.roomId, '');
+    await until(() => host.state.players.size === 2, 'second player');
+    expect(host.state.players.get(host.sessionId)!.name).toBe('Driver');
+    expect(host.state.players.get(guest.sessionId)!.name).toBe('Driver 2');
+
+    guest.send(Msg.Rename, { name: '  Bob  ' });
+    await until(() => host.state.players.get(guest.sessionId)!.name === 'Bob', 'rename');
+    host.send(Msg.Rename, { name: 'bob' });
+    await until(() => host.state.players.get(host.sessionId)!.name === 'bob 2', 'deduped rename');
+    guest.send(Msg.Rename, { name: '   ' });
+    await sleep(120);
+    expect(host.state.players.get(guest.sessionId)!.name).toBe('Bob');
+  });
+
   it('lets only the host change settings, and never below the current head count', async () => {
     const host = await create('Host', { maxPlayers: 4, laps: 3 });
     const guest = await join(host.roomId, 'Guest');
@@ -210,7 +228,7 @@ describe('phone pad', () => {
     expect((await buzz).ms).toBe(200);
   });
 
-  it('allows one phone per car, rejects bad links, and lets the phone come back', async () => {
+  it('rejects bad links, lets the newest phone take over, and lets a phone come back', async () => {
     const ada = await create('Ada');
     const token = await padToken(ada);
 
@@ -218,9 +236,19 @@ describe('phone pad', () => {
 
     const pad = await joinPad(ada.roomId, token);
     await until(() => ada.state.players.get(ada.sessionId)!.pad === true, 'pad flag');
-    expect((await rejection(sdk().joinById(ada.roomId, { role: 'pad', token }))).code).toBe(JoinError.PadAlreadyConnected);
 
-    await pad.leave();
+    // A second phone on the same link (or the same phone after a reload) replaces the first at once.
+    const replaced = new Promise<number>((resolve) => pad.onLeave((code) => resolve(code)));
+    const second = await joinPad(ada.roomId, token);
+    expect(await replaced).toBe(PAD_REPLACED);
+    expect(ada.state.players.get(ada.sessionId)!.pad).toBe(true);
+    const fromSecond = nextMessage<PadInputMessage>(ada, Msg.PadInput);
+    second.send(Msg.PadInput, [0.5, 1, 0, 0]);
+    expect(await fromSecond).toEqual([0.5, 1, 0, 0]);
+
+    // A phone that drops without warning frees the car straight away and can walk back in.
+    second.reconnection.enabled = false;
+    await second.leave(false);
     await until(() => ada.state.players.get(ada.sessionId)!.pad === false, 'pad to unbind');
     const again = await joinPad(ada.roomId, token);
     await until(() => ada.state.players.get(ada.sessionId)!.pad === true, 'pad to rebind');
@@ -229,6 +257,93 @@ describe('phone pad', () => {
     const kicked = new Promise<void>((resolve) => again.onLeave(() => resolve()));
     await ada.leave();
     await kicked;
+  });
+});
+
+describe('recovery', () => {
+  it('holds a dropped display’s seat and gives it back, phone pairing included', async () => {
+    const ada = await create('Ada');
+    const bob = await join(ada.roomId, 'Bob');
+    await until(() => ada.state.players.size === 2, 'second player');
+    const token = await padToken(bob);
+    const resume = bob.reconnectionToken;
+
+    // The tab reloads: the socket just goes away.
+    bob.reconnection.enabled = false;
+    await bob.leave(false);
+    await until(() => ada.state.players.get(bob.sessionId)?.connected === false, 'seat to be held');
+    expect(ada.state.players.size).toBe(2);
+
+    const back = track((await sdk().reconnect(resume)) as GameRoom);
+    expect(back.sessionId).toBe(bob.sessionId);
+    await until(() => ada.state.players.get(bob.sessionId)?.connected === true, 'seat to be reclaimed');
+    expect(await padToken(back)).toBe(token);
+  });
+
+  it('tells a returning display where the race stands', async () => {
+    const ada = await create('Ada', { laps: 1 });
+    await synced(ada);
+    const lobby = nextMessage<SyncMessage>(ada, Msg.Sync);
+    ada.send(Msg.Sync);
+    expect(await lobby).toMatchObject({ phase: 'lobby', goInMs: null });
+
+    ada.send(Msg.Start);
+    await until(() => ada.state.phase === 'countdown', 'countdown');
+    const resume = ada.reconnectionToken;
+    ada.reconnection.enabled = false;
+    await ada.leave(false);
+
+    const back = track((await sdk().reconnect(resume)) as GameRoom);
+    const counting = nextMessage<SyncMessage>(back, Msg.Sync);
+    back.send(Msg.Sync);
+    const sync = await counting;
+    expect(sync.phase).toBe('countdown');
+    expect(sync.goInMs).toBeGreaterThan(0);
+    expect(sync.goInMs).toBeLessThanOrEqual(4000);
+  });
+
+  it('can bring a room back under its old code and pairing token', async () => {
+    const first = await create('Ada');
+    const code = first.roomId;
+    const token = await padToken(first);
+
+    // While the room is alive its code cannot be claimed by anyone else.
+    expect((await rejection(sdk().create(ROOM_NAME, { role: 'player', name: 'Eve', code }))).code).toBe(JoinError.CodeTaken);
+
+    await first.leave();
+    let restored: GameRoom | null = null;
+    await until(() => {
+      if (!restored) void create('Ada', { code, padToken: token }).then((room) => (restored = room), () => {});
+      return restored !== null;
+    }, 'room to be recreated');
+    expect(restored!.roomId).toBe(code);
+    expect(await padToken(restored!)).toBe(token);
+    // The phone's old link works again without rescanning.
+    await joinPad(code, token);
+    await until(() => restored!.state.players?.get(restored!.sessionId)?.pad === true, 'pad to pair');
+  });
+});
+
+describe('solo practice room', () => {
+  it('is a hidden one-seat room that still pairs a phone and relays its input', async () => {
+    const solo = await create('Solo', { practice: true, maxPlayers: 8, isPrivate: false });
+    await synced(solo);
+    expect(solo.state).toMatchObject({ practice: true, isPrivate: true, maxPlayers: 1, phase: 'lobby' });
+    await sleep(60);
+    expect((await listing()).map((room) => room.code)).not.toContain(solo.roomId);
+    expect((await rejection(sdk().joinById(solo.roomId, { role: 'player', name: 'Gatecrasher' }))).code).toBe(JoinError.RoomFull);
+
+    // It cannot be opened up or turned into a race.
+    solo.send(Msg.Settings, { isPrivate: false, maxPlayers: 4 });
+    solo.send(Msg.Start);
+    await sleep(120);
+    expect(solo.state).toMatchObject({ isPrivate: true, maxPlayers: 1, phase: 'lobby' });
+
+    const pad = await joinPad(solo.roomId, await padToken(solo));
+    await until(() => solo.state.players.get(solo.sessionId)!.pad === true, 'pad flag');
+    const received = nextMessage<PadInputMessage>(solo, Msg.PadInput);
+    pad.send(Msg.PadInput, [-0.25, 1, 0, 0]);
+    expect(await received).toEqual([-0.25, 1, 0, 0]);
   });
 });
 

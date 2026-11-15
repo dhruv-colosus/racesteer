@@ -1,14 +1,16 @@
 import * as THREE from 'three';
-import { pointOnTrack, type TrackPath } from '@racing/shared';
+import { BOOST_PAD, pointOnTrack, type TrackPath } from '@racing/shared';
 import { TRACKSIDE } from './config';
+import type { Terrain } from './terrain';
 
-/** Everything static in the world: sky, ground, road, kerbs, barriers, start gantry, trees. */
+/** Everything in the world but the cars: sky, hills, road, kerbs, barriers, boost pads, start gantry, trees. */
 
 export const SKY = { top: 0x2f7fe0, horizon: 0xcfe6f7, fog: 0xcfe6f7 };
 
 interface Edge {
   /** Lateral offset from the centre line; positive is right of travel. */
   offset: number;
+  /** Height above the road surface. */
   y: number;
 }
 
@@ -31,10 +33,10 @@ function ribbon(path: TrackPath, a: Edge, b: Edge, tile: number): THREE.BufferGe
     positions.set(
       [
         path.x[i]! + rx * a.offset,
-        a.y,
+        path.y[i]! + a.y,
         path.z[i]! + rz * a.offset,
         path.x[i]! + rx * b.offset,
-        b.y,
+        path.y[i]! + b.y,
         path.z[i]! + rz * b.offset,
       ],
       r * 6,
@@ -132,7 +134,7 @@ function createSky(): THREE.Mesh {
 function createGantry(path: TrackPath): THREE.Group {
   const start = pointOnTrack(path, 0);
   const group = new THREE.Group();
-  group.position.set(start.x, 0, start.z);
+  group.position.set(start.x, start.y, start.z);
   group.rotation.y = start.heading;
 
   const span = path.def.width / 2 + TRACKSIDE.kerbWidth + TRACKSIDE.wallGap + TRACKSIDE.wallThickness + 0.6;
@@ -173,7 +175,7 @@ function createGantry(path: TrackPath): THREE.Group {
   return group;
 }
 
-function createTrees(path: TrackPath): THREE.Group {
+function createTrees(path: TrackPath, terrain: Terrain): THREE.Group {
   const group = new THREE.Group();
   const rand = mulberry32(20261115);
   let minX = Infinity;
@@ -186,10 +188,10 @@ function createTrees(path: TrackPath): THREE.Group {
     minZ = Math.min(minZ, path.z[i]!);
     maxZ = Math.max(maxZ, path.z[i]!);
   }
-  const margin = 110;
+  const margin = 230;
   const clearance = path.def.width / 2 + TRACKSIDE.kerbWidth + TRACKSIDE.wallThickness + 5;
-  const spots: { x: number; z: number; scale: number }[] = [];
-  for (let attempt = 0; attempt < 4000 && spots.length < 520; attempt++) {
+  const spots: { x: number; y: number; z: number; scale: number }[] = [];
+  for (let attempt = 0; attempt < 14000 && spots.length < 1600; attempt++) {
     const x = minX - margin + rand() * (maxX - minX + margin * 2);
     const z = minZ - margin + rand() * (maxZ - minZ + margin * 2);
     let near = Infinity;
@@ -198,7 +200,10 @@ function createTrees(path: TrackPath): THREE.Group {
       if (d < near) near = d;
     }
     if (near < clearance * clearance) continue;
-    spots.push({ x, z, scale: 0.75 + rand() * 0.9 });
+    // Thicker woods on the hills than down in the flats.
+    const y = terrain.heightAt(x, z);
+    if (y < 3 && rand() < 0.45) continue;
+    spots.push({ x, y: y - 0.3, z, scale: 0.75 + rand() * 0.9 });
   }
 
   const trunks = new THREE.InstancedMesh(
@@ -217,9 +222,9 @@ function createTrees(path: TrackPath): THREE.Group {
   spots.forEach((spot, i) => {
     const s = spot.scale;
     quat.setFromAxisAngle(THREE.Object3D.DEFAULT_UP, rand() * Math.PI * 2);
-    matrix.compose(new THREE.Vector3(spot.x, 1.2 * s, spot.z), quat, new THREE.Vector3(s, s, s));
+    matrix.compose(new THREE.Vector3(spot.x, spot.y + 1.2 * s, spot.z), quat, new THREE.Vector3(s, s, s));
     trunks.setMatrixAt(i, matrix);
-    matrix.compose(new THREE.Vector3(spot.x, (2.2 + 3.1) * s, spot.z), quat, new THREE.Vector3(s, s, s));
+    matrix.compose(new THREE.Vector3(spot.x, spot.y + (2.2 + 3.1) * s, spot.z), quat, new THREE.Vector3(s, s, s));
     crowns.setMatrixAt(i, matrix);
     crowns.setColorAt(i, color.setHSL(0.3 + rand() * 0.06, 0.5 + rand() * 0.2, 0.24 + rand() * 0.12));
   });
@@ -232,7 +237,132 @@ function createTrees(path: TrackPath): THREE.Group {
   return group;
 }
 
-export function buildWorld(scene: THREE.Scene, path: TrackPath, maxAnisotropy: number): void {
+/** The hills: the shared terrain grid, tinted darker and rockier as it climbs and steepens. */
+function createTerrainMesh(terrain: Terrain, grassTexture: THREE.Texture): THREE.Mesh {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(terrain.positions, 3));
+  geometry.setIndex(new THREE.BufferAttribute(terrain.indices, 1));
+  geometry.computeVertexNormals();
+
+  const count = terrain.cols * terrain.rows;
+  const uvs = new Float32Array(count * 2);
+  const colors = new Float32Array(count * 3);
+  const normals = geometry.getAttribute('normal') as THREE.BufferAttribute;
+  const low = new THREE.Color(0xffffff);
+  const high = new THREE.Color(0xb7c99a);
+  const rock = new THREE.Color(0x9a8f80);
+  const color = new THREE.Color();
+  for (let v = 0; v < count; v++) {
+    const x = terrain.positions[v * 3]!;
+    const y = terrain.positions[v * 3 + 1]!;
+    const z = terrain.positions[v * 3 + 2]!;
+    uvs[v * 2] = x / 11;
+    uvs[v * 2 + 1] = z / 11;
+    const steep = 1 - normals.getY(v);
+    color.copy(low).lerp(high, Math.min(1, Math.max(0, (y - 6) / 45)));
+    color.lerp(rock, Math.min(1, Math.max(0, (steep - 0.18) / 0.25)));
+    colors.set([color.r, color.g, color.b], v * 3);
+  }
+  geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const mesh = new THREE.Mesh(geometry, new THREE.MeshLambertMaterial({ map: grassTexture, vertexColors: true }));
+  mesh.receiveShadow = true;
+  return mesh;
+}
+
+/**
+ * A patch of road surface `s0..s1` metres along the track, between two lateral
+ * offsets, lifted `lift` above the tarmac. Follows the road's rise and fall.
+ */
+function roadPatch(path: TrackPath, s0: number, s1: number, left: number, right: number, lift: number, segments: number) {
+  const positions = new Float32Array((segments + 1) * 2 * 3);
+  const uvs = new Float32Array((segments + 1) * 2 * 2);
+  for (let k = 0; k <= segments; k++) {
+    const s = s0 + ((s1 - s0) * k) / segments;
+    const a = pointOnTrack(path, s, left);
+    const b = pointOnTrack(path, s, right);
+    positions.set([a.x, a.y + lift, a.z, b.x, b.y + lift, b.z], k * 6);
+    const v = k / segments;
+    uvs.set([0, v, 1, v], k * 4);
+  }
+  const indices: number[] = [];
+  for (let k = 0; k < segments; k++) {
+    const a0 = k * 2;
+    indices.push(a0, a0 + 1, a0 + 2, a0 + 1, a0 + 3, a0 + 2);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+/** Glowing chevron pads on the road. Returns a function that scrolls the arrows. */
+function createBoostPads(scene: THREE.Scene, path: TrackPath): (dt: number) => void {
+  const pads = path.def.boostPads ?? [];
+  if (pads.length === 0) return () => {};
+
+  const arrows = canvasTexture(128, 128, (ctx, w, h) => {
+    ctx.fillStyle = '#0c4a6e';
+    ctx.fillRect(0, 0, w, h);
+    const grad = ctx.createLinearGradient(0, h, 0, 0);
+    grad.addColorStop(0, '#22d3ee');
+    grad.addColorStop(1, '#ecfeff');
+    ctx.fillStyle = grad;
+    // One chevron pointing along +V, the direction of travel. The canvas is
+    // flipped onto the texture, so its top edge is the far end of the pad.
+    ctx.beginPath();
+    ctx.moveTo(w * 0.08, h * 0.65);
+    ctx.lineTo(w * 0.5, h * 0.2);
+    ctx.lineTo(w * 0.92, h * 0.65);
+    ctx.lineTo(w * 0.92, h * 0.98);
+    ctx.lineTo(w * 0.5, h * 0.53);
+    ctx.lineTo(w * 0.08, h * 0.98);
+    ctx.closePath();
+    ctx.fill();
+  });
+  arrows.wrapT = THREE.RepeatWrapping;
+  arrows.repeat.set(1, 4);
+  const material = new THREE.MeshBasicMaterial({ map: arrows, toneMapped: false });
+
+  const rimTexture = canvasTexture(16, 16, (ctx, w, h) => {
+    ctx.fillStyle = '#ff2d78';
+    ctx.fillRect(0, 0, w, h);
+  });
+  const rim = new THREE.MeshBasicMaterial({ map: rimTexture, toneMapped: false });
+
+  for (const pad of pads) {
+    const s0 = pad.at * path.length;
+    const s1 = s0 + BOOST_PAD.length;
+    const half = BOOST_PAD.width / 2;
+    const surface = new THREE.Mesh(roadPatch(path, s0, s1, pad.lateral - half, pad.lateral + half, 0.045, 6), material);
+    scene.add(surface);
+    for (const [a, b] of [
+      [pad.lateral - half - 0.35, pad.lateral - half],
+      [pad.lateral + half, pad.lateral + half + 0.35],
+    ] as const) {
+      scene.add(new THREE.Mesh(roadPatch(path, s0 - 0.35, s1 + 0.35, a, b, 0.045, 6), rim));
+    }
+  }
+
+  let t = 0;
+  return (dt) => {
+    t += dt;
+    arrows.offset.y = -((t * 2.2) % 1);
+    // A gentle pulse so they catch the eye from a distance.
+    const glow = 0.85 + 0.15 * Math.sin(t * 7);
+    material.color.setRGB(glow, glow, glow);
+  };
+}
+
+export interface World {
+  /** Animates the moving bits of scenery. */
+  update(dt: number): void;
+}
+
+export function buildWorld(scene: THREE.Scene, path: TrackPath, terrain: Terrain, maxAnisotropy: number): World {
   scene.background = new THREE.Color(SKY.horizon);
   scene.fog = new THREE.Fog(SKY.fog, 160, 760);
   scene.add(createSky());
@@ -242,13 +372,34 @@ export function buildWorld(scene: THREE.Scene, path: TrackPath, maxAnisotropy: n
     speckle(ctx, w, h, '#4c8a3a', ['#3f7a31', '#5a9a45', '#467f36', '#6aa650'], 5000, 7),
   );
   grassTexture.wrapS = THREE.RepeatWrapping;
-  grassTexture.repeat.set(220, 220);
   grassTexture.anisotropy = maxAnisotropy;
-  const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(2400, 2400),
-    new THREE.MeshLambertMaterial({ map: grassTexture }),
-  );
-  ground.rotation.x = -Math.PI / 2;
+  scene.add(createTerrainMesh(terrain, grassTexture));
+  // Flat land beyond the hills, out to the horizon. A frame with the terrain
+  // grid cut out of it, not a sheet under everything: the road dips below
+  // sea level in places and a sheet would cover it.
+  const inset = terrain.cell;
+  const x0 = terrain.minX + inset;
+  const z0 = terrain.minZ + inset;
+  const x1 = terrain.minX + (terrain.cols - 1) * terrain.cell - inset;
+  const z1 = terrain.minZ + (terrain.rows - 1) * terrain.cell - inset;
+  const far = 2000;
+  const corners = [
+    [x0, z0], [x1, z0], [x1, z1], [x0, z1], // hole
+    [-far, -far], [far, -far], [far, far], [-far, far], // outer edge
+  ];
+  const farPositions = new Float32Array(corners.length * 3);
+  const farUvs = new Float32Array(corners.length * 2);
+  corners.forEach(([x, z], i) => {
+    farPositions.set([x!, -0.05, z!], i * 3);
+    farUvs.set([x! / 11, z! / 11], i * 2);
+  });
+  const farGeometry = new THREE.BufferGeometry();
+  farGeometry.setAttribute('position', new THREE.BufferAttribute(farPositions, 3));
+  farGeometry.setAttribute('uv', new THREE.BufferAttribute(farUvs, 2));
+  // One quad per side, between the hole's edge and the outer edge.
+  farGeometry.setIndex([0, 4, 1, 1, 4, 5, 1, 5, 2, 2, 5, 6, 2, 6, 3, 3, 6, 7, 3, 7, 0, 0, 7, 4]);
+  farGeometry.computeVertexNormals();
+  const ground = new THREE.Mesh(farGeometry, new THREE.MeshLambertMaterial({ map: grassTexture, side: THREE.DoubleSide }));
   ground.receiveShadow = true;
   scene.add(ground);
 
@@ -263,7 +414,7 @@ export function buildWorld(scene: THREE.Scene, path: TrackPath, maxAnisotropy: n
   });
   roadTexture.anisotropy = maxAnisotropy;
   const road = new THREE.Mesh(
-    ribbon(path, { offset: -half, y: 0.02 }, { offset: half, y: 0.02 }, 14),
+    ribbon(path, { offset: -half, y: 0.02 }, { offset: half, y: 0.02 }, 9),
     new THREE.MeshLambertMaterial({ map: roadTexture }),
   );
   road.receiveShadow = true;
@@ -306,9 +457,10 @@ export function buildWorld(scene: THREE.Scene, path: TrackPath, maxAnisotropy: n
     const inner = side * face;
     const outer = side * back;
     const faces: [Edge, Edge, THREE.Material][] = [
-      [{ offset: inner, y: 0 }, { offset: inner, y: top }, wallMaterial],
+      // Faces run a little below the road so no gap opens up where the ground dips.
+      [{ offset: inner, y: -0.6 }, { offset: inner, y: top }, wallMaterial],
       [{ offset: Math.min(inner, outer), y: top }, { offset: Math.max(inner, outer), y: top }, capMaterial],
-      [{ offset: outer, y: 0 }, { offset: outer, y: top }, wallMaterial],
+      [{ offset: outer, y: -0.6 }, { offset: outer, y: top }, wallMaterial],
     ];
     for (const [a, b, material] of faces) {
       const mesh = new THREE.Mesh(ribbon(path, a, b, 4), material);
@@ -335,12 +487,15 @@ export function buildWorld(scene: THREE.Scene, path: TrackPath, maxAnisotropy: n
   );
   // Lay the plane flat, then turn it so its width runs across the road.
   line.rotation.set(-Math.PI / 2, start.heading, 0, 'YXZ');
-  line.position.set(start.x, 0.035, start.z);
+  line.position.set(start.x, start.y + 0.035, start.z);
   line.receiveShadow = true;
   scene.add(line);
 
   scene.add(createGantry(path));
-  scene.add(createTrees(path));
+  scene.add(createTrees(path, terrain));
+  const animatePads = createBoostPads(scene, path);
+
+  return { update: animatePads };
 }
 
 export interface Lighting {
@@ -371,8 +526,9 @@ export function addLighting(scene: THREE.Scene): Lighting {
       // Snap to whole metres so shadow edges do not crawl as the car moves.
       const x = Math.round(target.x);
       const z = Math.round(target.z);
-      sun.target.position.set(x, 0, z);
-      sun.position.set(x + offset.x, offset.y, z + offset.z);
+      const y = Math.round(target.y);
+      sun.target.position.set(x, y, z);
+      sun.position.set(x + offset.x, y + offset.y, z + offset.z);
     },
   };
 }

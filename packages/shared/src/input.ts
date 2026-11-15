@@ -47,7 +47,7 @@ export interface TiltOptions {
   curve: number;
 }
 
-export const DEFAULT_TILT: Readonly<TiltOptions> = { deadZoneDeg: 2, fullLockDeg: 35, curve: 1.25 };
+export const DEFAULT_TILT: Readonly<TiltOptions> = { deadZoneDeg: 2, fullLockDeg: 28, curve: 1.25 };
 
 /** Below this much gravity in the screen plane the phone is lying too flat to read a roll angle. */
 const MIN_PLANAR_GRAVITY = 1.5;

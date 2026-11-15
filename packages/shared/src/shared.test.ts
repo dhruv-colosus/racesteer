@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
+  BOOST_PAD,
   TRACKS,
   advanceProgress,
+  boostPadAt,
   buildTrackPath,
   currentLap,
   decodePadInput,
@@ -31,8 +33,8 @@ const path = buildTrackPath(track);
 
 describe('track path', () => {
   it('is a closed loop with even spacing', () => {
-    expect(path.length).toBeGreaterThan(900);
-    expect(path.length).toBeLessThan(1500);
+    expect(path.length).toBeGreaterThan(1500);
+    expect(path.length).toBeLessThan(2400);
     for (let i = 0; i < path.n; i++) {
       const j = (i + 1) % path.n;
       const d = Math.hypot(path.x[j]! - path.x[i]!, path.z[j]! - path.z[i]!);
@@ -83,6 +85,32 @@ describe('track path', () => {
     const stale = projectOnTrack(path, p.x, p.z, (full.index + path.n / 2) % path.n);
     expect(hinted.index).toBe(full.index);
     expect(stale.index).toBe(full.index);
+  });
+
+  it('rises and falls, but never steeper than a driveable grade', () => {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let i = 0; i < path.n; i++) {
+      lo = Math.min(lo, path.y[i]!);
+      hi = Math.max(hi, path.y[i]!);
+      expect(Math.abs(path.grade[i]!)).toBeLessThan(0.13);
+    }
+    expect(hi - lo).toBeGreaterThan(10);
+    // The grid sits on the flat.
+    for (let i = 0; i < 8; i++) expect(Math.abs(gridSlot(path, i).grade)).toBeLessThan(0.02);
+  });
+
+  it('puts every boost pad on the road and finds it again', () => {
+    const pads = track.boostPads ?? [];
+    expect(pads.length).toBeGreaterThan(3);
+    pads.forEach((pad, i) => {
+      expect(Math.abs(pad.lateral) + BOOST_PAD.width / 2).toBeLessThanOrEqual(track.width / 2 - 1);
+      const s = pad.at * path.length;
+      expect(boostPadAt(path, s + BOOST_PAD.length / 2, pad.lateral)).toBe(i);
+      expect(boostPadAt(path, s + BOOST_PAD.length / 2, pad.lateral + BOOST_PAD.width)).toBe(-1);
+      expect(boostPadAt(path, s - 1, pad.lateral)).toBe(-1);
+      expect(boostPadAt(path, s + BOOST_PAD.length + 1, pad.lateral)).toBe(-1);
+    });
   });
 
   it('puts the grid behind the line, on the road, no two cars overlapping', () => {
@@ -203,15 +231,15 @@ describe('tilt steering', () => {
   it('maps roll to steering with a dead zone, a centre offset and a hard lock', () => {
     expect(tiltToSteer(1.5)).toBe(0);
     expect(tiltToSteer(-1.5)).toBe(0);
-    expect(tiltToSteer(35)).toBe(1);
+    expect(tiltToSteer(28)).toBe(1);
     expect(tiltToSteer(80)).toBe(1);
     expect(tiltToSteer(-50)).toBe(-1);
-    const half = tiltToSteer(18.5);
+    const half = tiltToSteer(15);
     expect(half).toBeGreaterThan(0.3);
     expect(half).toBeLessThan(0.5);
-    expect(tiltToSteer(-18.5)).toBeCloseTo(-half, 6);
+    expect(tiltToSteer(-15)).toBeCloseTo(-half, 6);
     expect(tiltToSteer(12, 10)).toBe(0); // re-centred at 10°
-    expect(tiltToSteer(45, 10)).toBe(1);
+    expect(tiltToSteer(38, 10)).toBe(1);
   });
 
   it('round-trips pad input and rejects junk', () => {

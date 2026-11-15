@@ -41,6 +41,7 @@ export function Hud({ ref, place, total, color, goAt, finalTimeMs, onPause }: Hu
   const boostFill = useRef<HTMLDivElement>(null);
   const warning = useRef<HTMLDivElement>(null);
   const hint = useRef<HTMLDivElement>(null);
+  const fps = useRef<HTMLDivElement>(null);
   const map = useRef<HTMLCanvasElement>(null);
   const mapBase = useRef<{ image: HTMLCanvasElement; project(x: number, z: number): [number, number] } | null>(null);
   const timing = useRef({ goAt, finalTimeMs });
@@ -113,8 +114,11 @@ export function Hud({ ref, place, total, color, goAt, finalTimeMs, onPause }: Hu
       needle.current?.setAttribute('transform', `rotate(${DIAL_START + f.rpm * DIAL_SWEEP} 100 100)`);
       if (boostFill.current) boostFill.current.style.transform = `scaleY(${f.boost.toFixed(3)})`;
       boost.current?.classList.toggle('boost--active', f.boosting);
-      if (warning.current) warning.current.hidden = !f.wrongWay;
-      setText('hint', hint.current, f.padActive ? 'PHONE CONNECTED — TILT TO STEER' : 'WASD / ARROWS · SHIFT BOOST · R RESET · M MUTE');
+      if (warning.current) warning.current.hidden = !f.wrongWay && !f.wrecked;
+      if (f.wrecked || f.wrongWay) setText('warning', warning.current, f.wrecked ? 'Wrecked' : 'Wrong way');
+      if (fps.current) fps.current.hidden = f.fps === null;
+      if (f.fps !== null) setText('fps', fps.current, `${Math.round(f.fps)} FPS`);
+      setText('hint', hint.current, f.padActive ? 'PHONE CONNECTED — TILT TO STEER' : 'WASD / ARROWS · SHIFT BOOST · R RESET · M MUTE · F FPS');
 
       const base = mapBase.current;
       const canvas = map.current;
@@ -185,6 +189,8 @@ export function Hud({ ref, place, total, color, goAt, finalTimeMs, onPause }: Hu
           <b ref={time}>0:00.00</b>
         </div>
       </div>
+
+      <div className="hud-fps caps" ref={fps} hidden />
 
       <div className="hud-warning caps" ref={warning} hidden>
         Wrong way

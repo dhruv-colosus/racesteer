@@ -47,5 +47,13 @@ export const JoinError = {
   RoomFull: 4101,
   RaceInProgress: 4102,
   BadPadToken: 4103,
-  PadAlreadyConnected: 4104,
+  /** Creating a room with a requested code that is already in use. */
+  CodeTaken: 4104,
 } as const;
+
+/** Close code a phone gets when another phone takes over the same car. It must not fight to get it back. */
+export const PAD_REPLACED = 4105;
+
+/** How long a dropped display keeps its seat: short in the lobby, longer once a race is on. */
+export const LOBBY_HOLD_SECONDS = 20;
+export const RACE_HOLD_SECONDS = 45;

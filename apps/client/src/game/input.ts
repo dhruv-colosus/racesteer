@@ -52,7 +52,8 @@ export class InputManager {
     this.lastSample = now;
 
     const target = (this.down('ArrowRight', 'KeyD') ? 1 : 0) - (this.down('ArrowLeft', 'KeyA') ? 1 : 0);
-    const rate = target === 0 ? 7 : 4.5;
+    // Full lock in about a tenth of a second: quick enough to feel direct, slow enough for small corrections.
+    const rate = target === 0 ? 16 : 10;
     const delta = target - this.keySteer;
     this.keySteer += Math.sign(delta) * Math.min(Math.abs(delta), rate * dt);
 

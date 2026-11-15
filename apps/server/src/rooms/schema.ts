@@ -7,6 +7,7 @@ export const Player = schema(
     color: t.uint8(),
     ready: t.boolean(),
     pad: t.boolean(),
+    connected: t.boolean(),
     slot: t.uint8(),
     x: t.float32(),
     y: t.float32(),
@@ -30,6 +31,7 @@ export type Player = SchemaType<typeof Player>;
 export const RaceState = schema(
   {
     phase: t.string(),
+    practice: t.boolean(),
     roomName: t.string(),
     maxPlayers: t.uint8(),
     isPrivate: t.boolean(),

@@ -3,6 +3,7 @@ import {
   INTERP_DELAY_MS,
   NET_SEND_HZ,
   advanceProgress,
+  boostPadAt,
   buildTrackPath,
   currentLap,
   getTrack,
@@ -20,11 +21,13 @@ import {
   type TransformMessage,
 } from '@racing/shared';
 import { EngineAudio } from './audio';
+import { resolveBarriers, wreck } from './barrier';
 import { createCarMesh, createNameTag, type CarMesh } from './carMesh';
-import { CAR, PHYSICS_DT } from './config';
+import { BARRIER, CAR, PHYSICS_DT, PHYSICS_HZ, TRACKSIDE } from './config';
 import type { InputManager } from './input';
 import { LocalCar, PhysicsWorld, RemoteBody, initPhysics, type Pose } from './physics';
-import { addLighting, buildWorld, type Lighting } from './scene';
+import { addLighting, buildWorld, type Lighting, type World } from './scene';
+import { buildTerrain } from './terrain';
 
 /** What the HUD needs each frame. Plain numbers so the HUD can write them straight to the DOM. */
 export interface HudFrame {
@@ -40,10 +43,14 @@ export interface HudFrame {
   lap: number;
   laps: number;
   wrongWay: boolean;
+  /** Crashed head-on into a barrier; the car is put back on the track shortly. */
+  wrecked: boolean;
   x: number;
   z: number;
   others: { x: number; z: number; color: string }[];
   padActive: boolean;
+  /** Frames per second, or null when the readout is switched off. */
+  fps: number | null;
 }
 
 export interface GameOptions {
@@ -59,8 +66,10 @@ export interface GameOptions {
   onNet?(transform: TransformMessage): void;
   /** The local car has completed the race distance. */
   onFinish?(): void;
-  /** A hard knock, 0..1. */
+  /** A hard knock (or a boost pad), 0..1. */
   onImpact?(strength: number): void;
+  /** The simulation keeps throwing and has stopped; the stage should be rebuilt. */
+  onCrash?(error: unknown): void;
 }
 
 interface Snapshot extends Pose {
@@ -78,7 +87,9 @@ interface RemoteCar {
   pose: Pose | null;
 }
 
-const GEARS = [0, 13, 24, 35, 46, 58, 80];
+const GEARS = [0, 16, 30, 44, 58, 72, 100];
+/** Enough catch-up steps to stay real-time down to about 20 frames per second. */
+const MAX_STEPS_PER_FRAME = Math.ceil(PHYSICS_HZ / 20);
 const HOLD_INPUT: DriveInput = { steer: 0, throttle: 0, brake: 0, boost: false };
 
 const _q0 = new THREE.Quaternion();
@@ -123,8 +134,9 @@ export class Game {
   readonly path: TrackPath;
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene = new THREE.Scene();
-  private readonly camera = new THREE.PerspectiveCamera(62, 1, 0.3, 2000);
+  private readonly camera = new THREE.PerspectiveCamera(66, 1, 0.3, 2000);
   private readonly lighting: Lighting;
+  private readonly world: World;
   private readonly physics: PhysicsWorld;
   private readonly car: LocalCar;
   private readonly carMesh: CarMesh;
@@ -148,13 +160,25 @@ export class Game {
   private trackS = 0;
   private wrongWay = false;
   private stuckFor = 0;
+  /** Seconds the car has spent outside the barriers. */
+  private offTrackFor = 0;
+  /** A head-on crash in progress: seconds left, and where on the track to put the car back. */
+  private wreck: { left: number; s: number; lateral: number } | null = null;
+  /** Pad the car is currently on, so one pass gives one kick. */
+  private onPad = -1;
+  /** Frames in a row that threw. */
+  private faults = 0;
   /** Input used by the most recent physics step. */
   private lastInput: DriveInput = HOLD_INPUT;
 
   private readonly camForward = new THREE.Vector3(0, 0, 1);
   private shake = 0;
-  /** Smoothed frames per second, for diagnostics. */
+  /** Smoothed frames per second. */
   fps = 60;
+  private showFps = false;
+  private pixelRatio = 1;
+  /** Seconds the frame rate has been below target; drives the quality fallback. */
+  private slowFor = 0;
 
   static async create(options: GameOptions): Promise<Game> {
     await initPhysics();
@@ -165,22 +189,24 @@ export class Game {
     this.path = buildTrackPath(getTrack(options.trackId));
 
     this.renderer = new THREE.WebGLRenderer({ canvas: options.canvas, antialias: true, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.pixelRatio = Math.min(window.devicePixelRatio, 2);
+    this.renderer.setPixelRatio(this.pixelRatio);
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.05;
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
-    buildWorld(this.scene, this.path, this.renderer.capabilities.getMaxAnisotropy());
+    const terrain = buildTerrain(this.path);
+    this.world = buildWorld(this.scene, this.path, terrain, this.renderer.capabilities.getMaxAnisotropy());
     this.lighting = addLighting(this.scene);
 
-    this.physics = new PhysicsWorld(this.path);
+    this.physics = new PhysicsWorld(this.path, terrain);
     this.car = new LocalCar(this.physics);
     this.carMesh = createCarMesh(options.color);
     this.scene.add(this.carMesh.group);
 
     const slot = gridSlot(this.path, options.slot);
-    this.car.place(slot.x, slot.z, slot.heading);
+    this.car.place(slot.x, slot.y, slot.z, slot.heading, slot.grade);
     this.prevPose = this.currPose = this.car.pose();
     this.camForward.set(Math.sin(slot.heading), 0, Math.cos(slot.heading));
 
@@ -188,6 +214,7 @@ export class Game {
       this.audio.resume();
       if (code === 'KeyR') this.respawn();
       if (code === 'KeyM') this.audio.toggleMute();
+      if (code === 'KeyF') this.showFps = !this.showFps;
     };
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
@@ -253,18 +280,46 @@ export class Game {
 
   // ---- simulation ----------------------------------------------------------
 
+  /**
+   * Picks a race back up part-way through, after a reload or a rebuilt stage:
+   * the car goes back on the track nearest to where the server last saw it,
+   * with the lap progress the server has on record.
+   */
+  resume(x: number, z: number, count: number, finished: boolean) {
+    this.currPose = { ...this.currPose, x, z };
+    this.trackHint = -1;
+    this.respawn();
+    const proj = projectOnTrack(this.path, this.currPose.x, this.currPose.z, -1);
+    this.trackHint = proj.index;
+    this.progress.count = count;
+    this.progress.sector = sectorOf(proj.s, this.path.length, this.path.def.sectors);
+    this.finished = finished;
+    const heading = pointOnTrack(this.path, proj.s, 0).heading;
+    this.camForward.set(Math.sin(heading), 0, Math.cos(heading));
+  }
+
   private respawn() {
     const proj = projectOnTrack(this.path, this.currPose.x, this.currPose.z, this.trackHint);
+    this.placeOnTrack(proj.s, proj.lateral);
+  }
+
+  /** Puts the car down at rest, facing along the track, `s` metres round and `lateral` across (kept off the barriers). */
+  private placeOnTrack(s: number, lateral: number) {
     const limit = this.path.def.width / 2 - 2.5;
-    const spot = pointOnTrack(this.path, proj.s, Math.max(-limit, Math.min(limit, proj.lateral)));
-    this.car.place(spot.x, spot.z, spot.heading);
+    const spot = pointOnTrack(this.path, s, Math.max(-limit, Math.min(limit, lateral)));
+    this.car.place(spot.x, spot.y, spot.z, spot.heading, spot.grade);
     this.prevPose = this.currPose = this.car.pose();
+    this.camForward.set(Math.sin(spot.heading), 0, Math.cos(spot.heading));
     this.stuckFor = 0;
+    this.offTrackFor = 0;
+    this.onPad = -1;
+    this.wreck = null;
   }
 
   private fixedStep(now: number) {
     const live = now >= this.goAt && !this.finished;
-    const input = live ? this.options.input.sample(now) : HOLD_INPUT;
+    const wrecked = this.wreck !== null;
+    const input = live && !wrecked ? this.options.input.sample(now) : HOLD_INPUT;
     this.lastInput = input;
 
     const renderTime = now - INTERP_DELAY_MS;
@@ -274,8 +329,19 @@ export class Game {
     }
 
     this.prevPose = this.currPose;
-    this.car.update(input, PHYSICS_DT, !live);
+    // A wrecked car gets no throttle and no air control, so it tumbles freely.
+    this.car.update(input, PHYSICS_DT, !live || wrecked);
     this.physics.step();
+
+    const hit = resolveBarriers(this.car, this.path, this.trackHint, wrecked);
+    if (hit?.headOn) {
+      const at = this.car.body.translation();
+      const proj = projectOnTrack(this.path, at.x, at.z, this.trackHint);
+      this.wreck = { left: BARRIER.wreckTime, s: proj.s, lateral: proj.lateral };
+      wreck(this.car, hit);
+      this.shake = 1;
+      this.options.onImpact?.(1);
+    }
     this.currPose = this.car.pose();
 
     // Lap progress.
@@ -296,6 +362,16 @@ export class Game {
     const along = fx * this.path.tx[proj.index]! + fz * this.path.tz[proj.index]!;
     this.wrongWay = live && along < -0.35 && this.car.forwardSpeed > 4;
 
+    // Boost pads: one kick per pass, only when driving the right way.
+    const pad = boostPadAt(this.path, proj.s, proj.lateral);
+    const groundY = this.path.y[proj.index]!;
+    if (pad >= 0 && pad !== this.onPad && live && !wrecked && along > 0.5 && this.currPose.y - groundY < 2.5) {
+      this.car.hitBoostPad();
+      this.shake = Math.max(this.shake, 0.25);
+      this.options.onImpact?.(0.35);
+    }
+    this.onPad = pad;
+
     // Knocks.
     if (this.car.impact > 3.5) {
       const strength = Math.min(1, this.car.impact / 14);
@@ -305,9 +381,20 @@ export class Game {
 
     // Recover a car that has ended up on its roof or out of the world.
     const upY = 1 - 2 * (qx * qx + qz * qz);
-    if (upY < 0.3 || this.currPose.y < -4 || this.currPose.y > 40) this.stuckFor += PHYSICS_DT;
+    const height = this.currPose.y - groundY;
+    if (upY < 0.3 || height < -4 || height > 40) this.stuckFor += PHYSICS_DT;
     else this.stuckFor = 0;
-    if (this.stuckFor > 1.2) this.respawn();
+    // Launched over the barrier into the hills: bring it back.
+    const barrier = this.path.def.width / 2 + TRACKSIDE.kerbWidth + TRACKSIDE.wallGap + TRACKSIDE.wallThickness;
+    if (Math.abs(proj.lateral) > barrier + 1) this.offTrackFor += PHYSICS_DT;
+    else this.offTrackFor = 0;
+    if (this.wreck) {
+      // The wreck plays out, then the car goes back where it crashed; the usual recovery waits.
+      this.wreck.left -= PHYSICS_DT;
+      if (this.wreck.left <= 0) this.placeOnTrack(this.wreck.s, this.wreck.lateral);
+    } else if (this.stuckFor > 1.2 || this.offTrackFor > 1.5) {
+      this.respawn();
+    }
 
     this.netAccumulator += PHYSICS_DT;
     if (this.netAccumulator >= 1 / NET_SEND_HZ) {
@@ -331,21 +418,61 @@ export class Game {
   private frame = (now: number) => {
     if (!this.running) return;
     this.raf = requestAnimationFrame(this.frame);
+    try {
+      this.tick(now);
+      this.faults = 0;
+    } catch (error) {
+      // One bad frame is survivable; a run of them means the simulation is broken and needs rebuilding.
+      console.error('[game] frame failed', error);
+      if (++this.faults >= 5) {
+        this.running = false;
+        cancelAnimationFrame(this.raf);
+        this.options.onCrash?.(error);
+      }
+    }
+  };
+
+  private tick(now: number) {
     const dt = Math.min(0.1, (now - this.lastFrame) / 1000);
     this.lastFrame = now;
     if (dt > 0) this.fps += (1 / dt - this.fps) * 0.05;
 
     this.accumulator += dt;
     let steps = 0;
-    while (this.accumulator >= PHYSICS_DT && steps < 6) {
+    while (this.accumulator >= PHYSICS_DT && steps < MAX_STEPS_PER_FRAME) {
       this.fixedStep(now);
       this.accumulator -= PHYSICS_DT;
       steps++;
     }
-    if (steps === 6) this.accumulator = 0; // fell too far behind (tab was in the background): drop the backlog
+    if (steps === MAX_STEPS_PER_FRAME) this.accumulator = 0; // fell too far behind (tab was in the background): drop the backlog
+
+    this.guardFrameRate(dt);
 
     this.render(now, dt, this.accumulator / PHYSICS_DT);
-  };
+  }
+
+  /**
+   * If the machine cannot hold a smooth frame rate, trade sharpness for it:
+   * first render fewer pixels, then drop shadows. Low frame rate reads as
+   * input lag, so this matters more than the extra detail. Never steps back up,
+   * to avoid flickering between settings.
+   */
+  private guardFrameRate(dt: number) {
+    if (dt >= 0.1 || document.visibilityState !== 'visible') {
+      this.slowFor = 0; // a stalled or hidden tab says nothing about rendering cost
+      return;
+    }
+    this.slowFor = this.fps < 50 ? this.slowFor + dt : 0;
+    if (this.slowFor < 1.5) return;
+    this.slowFor = 0;
+    if (this.pixelRatio > 1) {
+      this.pixelRatio = Math.max(1, this.pixelRatio - 0.25);
+      this.renderer.setPixelRatio(this.pixelRatio);
+      this.resize();
+    } else if (this.lighting.sun.castShadow) {
+      this.lighting.sun.castShadow = false;
+    }
+  }
 
   private render(now: number, dt: number, alpha: number) {
     // Local car, blended between the last two physics states so motion stays smooth at any refresh rate.
@@ -379,6 +506,7 @@ export class Game {
       others.push({ x: snapshot.x, z: snapshot.z, color: remote.color });
     }
 
+    this.world.update(dt);
     this.updateCamera(pose, dt);
     this.lighting.follow(group.position);
     this.renderer.render(this.scene, this.camera);
@@ -404,10 +532,12 @@ export class Game {
       lap: currentLap(this.progress.count, this.options.laps, sectors),
       laps: this.options.laps,
       wrongWay: this.wrongWay,
+      wrecked: this.wreck !== null,
       x: pose.x,
       z: pose.z,
       others,
       padActive: this.options.input.padActive,
+      fps: this.showFps ? this.fps : null,
     });
   }
 
@@ -416,14 +546,15 @@ export class Game {
     _q0.set(pose.qx, pose.qy, pose.qz, pose.qw);
     _v.set(0, 0, 1).applyQuaternion(_q0);
     _v.y = 0;
-    if (_v.lengthSq() > 0.01) {
+    // A tumbling car's nose swings everywhere: hold the view steady until it is back on the track.
+    if (!this.wreck && _v.lengthSq() > 0.01) {
       _v.normalize();
       this.camForward.lerp(_v, 1 - Math.exp(-5.5 * dt)).normalize();
     }
 
     const speedRatio = Math.min(1.25, Math.abs(this.car.forwardSpeed) / CAR.maxSpeed);
-    const distance = 6.6 + speedRatio * 1.6;
-    const height = 2.7 + speedRatio * 0.25;
+    const distance = 6.1 + speedRatio * 1.5;
+    const height = 2.45 + speedRatio * 0.2;
 
     this.shake = Math.max(0, this.shake - dt * 2.5);
     const rumble = this.shake * 0.35 + Math.max(0, speedRatio - 0.75) * 0.05;
@@ -435,7 +566,8 @@ export class Game {
     );
     this.camera.lookAt(pose.x + this.camForward.x * 5, pose.y + 0.9, pose.z + this.camForward.z * 5);
 
-    const targetFov = 62 + speedRatio * 15 + (this.car.boosting ? 6 : 0);
+    // The view widens with speed — most of the sensation of going fast comes from this.
+    const targetFov = 66 + speedRatio * 20 + (this.car.boosting ? 7 : 0);
     if (Math.abs(targetFov - this.camera.fov) > 0.01) {
       this.camera.fov += (targetFov - this.camera.fov) * (1 - Math.exp(-4 * dt));
       this.camera.updateProjectionMatrix();
@@ -446,12 +578,16 @@ export class Game {
   telemetry() {
     return {
       fps: Math.round(this.fps),
+      hz: PHYSICS_HZ,
+      pixelRatio: this.pixelRatio,
+      shadows: this.lighting.sun.castShadow,
       speed: this.car.forwardSpeed,
       pose: this.currPose,
       s: this.trackS,
       count: this.progress.count,
       finished: this.finished,
       wrongWay: this.wrongWay,
+      wrecked: this.wreck !== null,
       boost: this.car.boost,
       remotes: this.remotes.size,
       drawCalls: this.renderer.info.render.calls,

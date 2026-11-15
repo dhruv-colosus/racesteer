@@ -2,6 +2,7 @@ import { Client, type Room } from '@colyseus/sdk';
 import {
   JoinError,
   ROOM_NAME,
+  sanitizeName,
   type CreateOptions,
   type JoinOptions,
   type RaceStateLike,
@@ -20,9 +21,14 @@ export function createRoom(options: CreateOptions): Promise<GameRoom> {
   return getClient().create(ROOM_NAME, options) as Promise<GameRoom>;
 }
 
-export function joinRoom(code: string, name: string): Promise<GameRoom> {
-  const options: JoinOptions = { role: 'player', name };
+export function joinRoom(code: string, name: string, padToken?: string): Promise<GameRoom> {
+  const options: JoinOptions = { role: 'player', name, padToken };
   return getClient().joinById(code, options) as Promise<GameRoom>;
+}
+
+/** Reclaims a seat the server is still holding for a dropped connection. */
+export function reconnectRoom(token: string): Promise<GameRoom> {
+  return getClient().reconnect(token) as Promise<GameRoom>;
 }
 
 export function joinAsPad(code: string, token: string): Promise<GameRoom> {
@@ -46,10 +52,8 @@ export function describeJoinError(error: unknown): string {
       return 'That race has already started. Try again when it finishes.';
     case JoinError.BadPadToken:
       return 'This controller link has expired. Scan the code on the screen again.';
-    case JoinError.PadAlreadyConnected:
-      return 'Another phone is already controlling this car.';
   }
-  if (message && /not found/i.test(message)) return 'No room with that code.';
+  if (code === 522 || (message && /not found/i.test(message))) return 'No room with that code.';
   if (message && /locked/i.test(message)) return 'That room is full.';
   if (error instanceof TypeError || (message && /fetch|network|ECONN/i.test(message))) {
     return 'Cannot reach the game server.';
@@ -79,9 +83,12 @@ export function loadName(): string {
     return '';
   }
 }
+/** Remembers the name the player typed. A blank name is not saved, so the "Driver" fallback never sticks. */
 export function saveName(name: string) {
+  const clean = sanitizeName(name, '');
+  if (!clean) return;
   try {
-    localStorage.setItem(NAME_KEY, name);
+    localStorage.setItem(NAME_KEY, clean);
   } catch {
     /* private mode — the name just will not be remembered */
   }
